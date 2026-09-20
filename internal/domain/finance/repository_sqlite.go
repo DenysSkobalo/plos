@@ -81,10 +81,10 @@ func (r *SQLiteRepository) GetLatestRates(ctx context.Context) ([]ExchangeRate, 
 
 func (r *SQLiteRepository) CreateAccount(ctx context.Context, acc *Account) error {
 	query := `
-		INSERT INTO accounts (id, name, type, currency, initial_balance, current_balance)
+		INSERT INTO accounts (id, name, type, currency, initial_balance_cents, current_balance_cents)
 		VALUES (?, ?, ?, ?, ?, ?)
 	`
-	_, err := r.db.ExecContext(ctx, query, acc.ID, acc.Name, string(acc.Type), acc.Currency, acc.InitialBalance, acc.CurrentBalance)
+	_, err := r.db.ExecContext(ctx, query, acc.ID, acc.Name, string(acc.Type), acc.Currency, acc.InitialBalanceCents, acc.CurrentBalanceCents)
 	if err != nil {
 		return fmt.Errorf("failed to create account: %w", err)
 	}
@@ -92,12 +92,12 @@ func (r *SQLiteRepository) CreateAccount(ctx context.Context, acc *Account) erro
 }
 
 func (r *SQLiteRepository) GetAccountByID(ctx context.Context, id string) (*Account, error) {
-	query := `SELECT id, name, type, currency, initial_balance, current_balance, created_at FROM accounts WHERE id = ?`
+	query := `SELECT id, name, type, currency, initial_balance_cents, current_balance_cents, created_at FROM accounts WHERE id = ?`
 	row := r.db.QueryRowContext(ctx, query, id)
 
 	var acc Account
 	var accType string
-	if err := row.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalance, &acc.CurrentBalance, &acc.CreatedAt); err != nil {
+	if err := row.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalanceCents, &acc.CurrentBalanceCents, &acc.CreatedAt); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -108,7 +108,7 @@ func (r *SQLiteRepository) GetAccountByID(ctx context.Context, id string) (*Acco
 }
 
 func (r *SQLiteRepository) GetAccounts(ctx context.Context) ([]Account, error) {
-	query := `SELECT id, name, type, currency, initial_balance, current_balance, created_at FROM accounts ORDER BY name ASC`
+	query := `SELECT id, name, type, currency, initial_balance_cents, current_balance_cents, created_at FROM accounts ORDER BY name ASC`
 	rows, err := r.db.QueryContext(ctx, query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query accounts: %w", err)
@@ -119,7 +119,7 @@ func (r *SQLiteRepository) GetAccounts(ctx context.Context) ([]Account, error) {
 	for rows.Next() {
 		var acc Account
 		var accType string
-		if err := rows.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalance, &acc.CurrentBalance, &acc.CreatedAt); err != nil {
+		if err := rows.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalanceCents, &acc.CurrentBalanceCents, &acc.CreatedAt); err != nil {
 			return nil, err
 		}
 		acc.Type = AccountType(accType)
@@ -130,20 +130,20 @@ func (r *SQLiteRepository) GetAccounts(ctx context.Context) ([]Account, error) {
 
 func (r *SQLiteRepository) SetDebtMetadata(ctx context.Context, meta *DebtMetadata) error {
 	query := `
-		INSERT INTO debt_metadata (account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status)
+		INSERT INTO debt_metadata (account_id, priority, creditor_name, original_currency, original_amount_cents, min_monthly_payment_uah_cents, deadline_date, status)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(account_id) DO UPDATE SET
 			priority=excluded.priority,
 			creditor_name=excluded.creditor_name,
 			original_currency=excluded.original_currency,
-			original_amount=excluded.original_amount,
-			min_monthly_payment_uah=excluded.min_monthly_payment_uah,
+			original_amount_cents=excluded.original_amount_cents,
+			min_monthly_payment_uah_cents=excluded.min_monthly_payment_uah_cents,
 			deadline_date=excluded.deadline_date,
 			status=excluded.status
 	`
 	_, err := r.db.ExecContext(ctx, query,
 		meta.AccountID, meta.Priority, meta.CreditorName, meta.OriginalCurrency,
-		meta.OriginalAmount, meta.MinMonthlyPaymentUAH, meta.DeadlineDate, string(meta.Status),
+		meta.OriginalAmountCents, meta.MinMonthlyPaymentUAHCents, meta.DeadlineDate, string(meta.Status),
 	)
 	if err != nil {
 		return fmt.Errorf("failed to set debt metadata: %w", err)
@@ -152,12 +152,12 @@ func (r *SQLiteRepository) SetDebtMetadata(ctx context.Context, meta *DebtMetada
 }
 
 func (r *SQLiteRepository) GetDebtMetadata(ctx context.Context, accountID string) (*DebtMetadata, error) {
-	query := `SELECT account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status FROM debt_metadata WHERE account_id = ?`
+	query := `SELECT account_id, priority, creditor_name, original_currency, original_amount_cents, min_monthly_payment_uah_cents, deadline_date, status FROM debt_metadata WHERE account_id = ?`
 	row := r.db.QueryRowContext(ctx, query, accountID)
 
 	var meta DebtMetadata
 	var status string
-	if err := row.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmount, &meta.MinMonthlyPaymentUAH, &meta.DeadlineDate, &status); err != nil {
+	if err := row.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmountCents, &meta.MinMonthlyPaymentUAHCents, &meta.DeadlineDate, &status); err != nil {
 		if err == sql.ErrNoRows {
 			return nil, nil
 		}
@@ -169,7 +169,7 @@ func (r *SQLiteRepository) GetDebtMetadata(ctx context.Context, accountID string
 
 func (r *SQLiteRepository) GetActiveDebtsOrderedByPriority(ctx context.Context) ([]DebtMetadata, error) {
 	query := `
-		SELECT account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status
+		SELECT account_id, priority, creditor_name, original_currency, original_amount_cents, min_monthly_payment_uah_cents, deadline_date, status
 		FROM debt_metadata
 		WHERE status != 'PAID'
 		ORDER BY priority ASC
@@ -184,7 +184,7 @@ func (r *SQLiteRepository) GetActiveDebtsOrderedByPriority(ctx context.Context) 
 	for rows.Next() {
 		var meta DebtMetadata
 		var status string
-		if err := rows.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmount, &meta.MinMonthlyPaymentUAH, &meta.DeadlineDate, &status); err != nil {
+		if err := rows.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmountCents, &meta.MinMonthlyPaymentUAHCents, &meta.DeadlineDate, &status); err != nil {
 			return nil, err
 		}
 		meta.Status = DebtStatus(status)
@@ -195,19 +195,55 @@ func (r *SQLiteRepository) GetActiveDebtsOrderedByPriority(ctx context.Context) 
 
 func (r *SQLiteRepository) CreateTransaction(ctx context.Context, tx *Transaction) error {
 	query := `
-		INSERT INTO transactions (id, source_account_id, destination_account_id, amount, currency, exchange_rate_applied, description, execution_date)
+		INSERT INTO transactions (id, source_account_id, destination_account_id, amount_cents, currency, exchange_rate_applied, description, execution_date)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 	`
-	_, err := r.db.ExecContext(ctx, query, tx.ID, tx.SourceAccountID, tx.DestinationAccountID, tx.Amount, tx.Currency, tx.ExchangeRateApplied, tx.Description, tx.ExecutionDate)
+	_, err := r.db.ExecContext(ctx, query, tx.ID, tx.SourceAccountID, tx.DestinationAccountID, tx.AmountCents, tx.Currency, tx.ExchangeRateApplied, tx.Description, tx.ExecutionDate)
 	if err != nil {
 		return fmt.Errorf("failed to create transaction: %w", err)
 	}
 	return nil
 }
 
+func (r *SQLiteRepository) ProcessTransaction(ctx context.Context, tx *Transaction) error {
+	dbTx, err := r.db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelSerializable})
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+	defer func() { _ = dbTx.Rollback() }()
+
+	queryInsert := `
+		INSERT INTO transactions (id, source_account_id, destination_account_id, amount_cents, currency, exchange_rate_applied, description, execution_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err = dbTx.ExecContext(ctx, queryInsert, tx.ID, tx.SourceAccountID, tx.DestinationAccountID, tx.AmountCents, tx.Currency, tx.ExchangeRateApplied, tx.Description, tx.ExecutionDate)
+	if err != nil {
+		return fmt.Errorf("failed to insert transaction: %w", err)
+	}
+
+	if tx.SourceAccountID != nil {
+		_, err = dbTx.ExecContext(ctx, `UPDATE accounts SET current_balance_cents = current_balance_cents - ? WHERE id = ?`, tx.AmountCents, *tx.SourceAccountID)
+		if err != nil {
+			return fmt.Errorf("failed to deduct balance from source account: %w", err)
+		}
+	}
+
+	if tx.DestinationAccountID != nil {
+		_, err = dbTx.ExecContext(ctx, `UPDATE accounts SET current_balance_cents = current_balance_cents + ? WHERE id = ?`, tx.AmountCents, *tx.DestinationAccountID)
+		if err != nil {
+			return fmt.Errorf("failed to credit balance to destination account: %w", err)
+		}
+	}
+
+	if err := dbTx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+	return nil
+}
+
 func (r *SQLiteRepository) GetTransactions(ctx context.Context, limit int) ([]Transaction, error) {
 	query := `
-		SELECT id, source_account_id, destination_account_id, amount, currency, exchange_rate_applied, description, execution_date, created_at
+		SELECT id, source_account_id, destination_account_id, amount_cents, currency, exchange_rate_applied, description, execution_date, created_at
 		FROM transactions
 		ORDER BY execution_date DESC, created_at DESC
 		LIMIT ?
@@ -221,7 +257,7 @@ func (r *SQLiteRepository) GetTransactions(ctx context.Context, limit int) ([]Tr
 	var list []Transaction
 	for rows.Next() {
 		var tx Transaction
-		if err := rows.Scan(&tx.ID, &tx.SourceAccountID, &tx.DestinationAccountID, &tx.Amount, &tx.Currency, &tx.ExchangeRateApplied, &tx.Description, &tx.ExecutionDate, &tx.CreatedAt); err != nil {
+		if err := rows.Scan(&tx.ID, &tx.SourceAccountID, &tx.DestinationAccountID, &tx.AmountCents, &tx.Currency, &tx.ExchangeRateApplied, &tx.Description, &tx.ExecutionDate, &tx.CreatedAt); err != nil {
 			return nil, err
 		}
 		list = append(list, tx)

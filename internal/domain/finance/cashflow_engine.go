@@ -10,18 +10,16 @@ func NewCashflowEngine() *CashflowEngine {
 	return &CashflowEngine{}
 }
 
-// ConvertToEUR конвертує суму в EUR за точним buyRate для UAH.
-func (e *CashflowEngine) ConvertToEUR(amount float64, currency string, buyRate float64) float64 {
+func (e *CashflowEngine) ConvertToEURCents(amountCents int64, currency string, buyRate float64) int64 {
 	if currency == "EUR" {
-		return amount
+		return amountCents
 	}
 	if currency == "UAH" && buyRate > 0 {
-		return amount / buyRate
+		return int64(math.Round(float64(amountCents) / buyRate))
 	}
-	return amount
+	return amountCents
 }
 
-// SimulateMonth виконує один крок помісячного каскадного погашення боргів.
 func (e *CashflowEngine) SimulateMonth(
 	monthName string,
 	incomes []IncomeItem,
@@ -35,85 +33,100 @@ func (e *CashflowEngine) SimulateMonth(
 		EffectiveBuyRate: buyRate,
 	}
 
-	// 1. Обчислення загального доходу в EUR
 	for _, inc := range incomes {
-		projection.TotalIncomeEUR += e.ConvertToEUR(inc.Amount, inc.Currency, buyRate)
+		projection.TotalIncomeEURCents += e.ConvertToEURCents(inc.AmountCents, inc.Currency, buyRate)
 	}
 
-	// 2. Обчислення фіксованих витрат в EUR
 	for _, exp := range expenses {
-		projection.TotalExpensesEUR += e.ConvertToEUR(exp.Amount, exp.Currency, buyRate)
+		projection.TotalExpensesEURCents += e.ConvertToEURCents(exp.AmountCents, exp.Currency, buyRate)
 	}
 
-	availableCashEUR := projection.TotalIncomeEUR - projection.TotalExpensesEUR
+	availableCashEURCents := projection.TotalIncomeEURCents - projection.TotalExpensesEURCents
 
-	// Копіюємо стан боргів для симуляції
 	currentDebts := make([]DebtPayoffState, len(debts))
 	copy(currentDebts, debts)
 
-	var totalDebtPaidEUR float64
+	var totalDebtPaidEURCents int64
 
-	// 3. Фаза A: Внесення мінімальних обов'язкових платежів
+	// Phase A: Mandatory Minimum Payments
 	for i := range currentDebts {
-		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalance <= 0 {
+		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalanceCents <= 0 {
 			continue
 		}
 
-		minPaymentEUR := e.ConvertToEUR(currentDebts[i].MinMonthlyPaymentUAH, "UAH", buyRate)
+		minPaymentEURCents := e.ConvertToEURCents(currentDebts[i].MinMonthlyPaymentUAHCents, "UAH", buyRate)
 		if currentDebts[i].OriginalCurrency == "EUR" {
-			minPaymentEUR = currentDebts[i].MinMonthlyPaymentUAH // якщо мінімальний платіж вказано безпосередньо в EUR
+			minPaymentEURCents = currentDebts[i].MinMonthlyPaymentUAHCents
 		}
 
-		// Платіж не може перевищувати залишок боргу
-		actualPaymentEUR := math.Min(minPaymentEUR, e.ConvertToEUR(currentDebts[i].RemainingBalance, currentDebts[i].OriginalCurrency, buyRate))
-		actualPaymentEUR = math.Min(actualPaymentEUR, availableCashEUR)
+		remainingDebtEURCents := e.ConvertToEURCents(currentDebts[i].RemainingBalanceCents, currentDebts[i].OriginalCurrency, buyRate)
+		actualPaymentEURCents := minPaymentEURCents
+		if remainingDebtEURCents < actualPaymentEURCents {
+			actualPaymentEURCents = remainingDebtEURCents
+		}
+		if availableCashEURCents < actualPaymentEURCents {
+			actualPaymentEURCents = availableCashEURCents
+		}
 
-		if actualPaymentEUR > 0 {
-			paymentInOriginalCurrency := actualPaymentEUR
-			if currentDebts[i].OriginalCurrency == "UAH" {
-				paymentInOriginalCurrency = actualPaymentEUR * buyRate
+		if actualPaymentEURCents > 0 {
+			var paymentInOriginalCurrencyCents int64
+			switch {
+			case actualPaymentEURCents >= remainingDebtEURCents:
+				paymentInOriginalCurrencyCents = currentDebts[i].RemainingBalanceCents
+			case currentDebts[i].OriginalCurrency == "UAH":
+				paymentInOriginalCurrencyCents = int64(math.Round(float64(actualPaymentEURCents) * buyRate))
+			default:
+				paymentInOriginalCurrencyCents = actualPaymentEURCents
 			}
 
-			currentDebts[i].RemainingBalance -= paymentInOriginalCurrency
-			availableCashEUR -= actualPaymentEUR
-			totalDebtPaidEUR += actualPaymentEUR
+			currentDebts[i].RemainingBalanceCents -= paymentInOriginalCurrencyCents
+			availableCashEURCents -= actualPaymentEURCents
+			totalDebtPaidEURCents += actualPaymentEURCents
 
-			if currentDebts[i].RemainingBalance <= 0.01 {
-				currentDebts[i].RemainingBalance = 0
+			if currentDebts[i].RemainingBalanceCents <= 0 {
+				currentDebts[i].RemainingBalanceCents = 0
 				currentDebts[i].Status = DebtStatusPaid
 			}
 		}
 	}
 
-	// 4. Фаза B: Каскадне спрямування залишку вільного кешфлоу на найвищий пріоритет (P1 -> P4)
+	// Phase B: Cascade Surplus Distribution
 	for i := range currentDebts {
-		if availableCashEUR <= 0 {
+		if availableCashEURCents <= 0 {
 			break
 		}
-		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalance <= 0 {
+		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalanceCents <= 0 {
 			continue
 		}
 
-		remainingDebtEUR := e.ConvertToEUR(currentDebts[i].RemainingBalance, currentDebts[i].OriginalCurrency, buyRate)
-		extraPaymentEUR := math.Min(availableCashEUR, remainingDebtEUR)
-
-		extraPaymentInOriginalCurrency := extraPaymentEUR
-		if currentDebts[i].OriginalCurrency == "UAH" {
-			extraPaymentInOriginalCurrency = extraPaymentEUR * buyRate
+		remainingDebtEURCents := e.ConvertToEURCents(currentDebts[i].RemainingBalanceCents, currentDebts[i].OriginalCurrency, buyRate)
+		extraPaymentEURCents := availableCashEURCents
+		if remainingDebtEURCents < extraPaymentEURCents {
+			extraPaymentEURCents = remainingDebtEURCents
 		}
 
-		currentDebts[i].RemainingBalance -= extraPaymentInOriginalCurrency
-		availableCashEUR -= extraPaymentEUR
-		totalDebtPaidEUR += extraPaymentEUR
+		var extraPaymentInOriginalCurrencyCents int64
+		switch {
+		case extraPaymentEURCents >= remainingDebtEURCents:
+			extraPaymentInOriginalCurrencyCents = currentDebts[i].RemainingBalanceCents
+		case currentDebts[i].OriginalCurrency == "UAH":
+			extraPaymentInOriginalCurrencyCents = int64(math.Round(float64(extraPaymentEURCents) * buyRate))
+		default:
+			extraPaymentInOriginalCurrencyCents = extraPaymentEURCents
+		}
 
-		if currentDebts[i].RemainingBalance <= 0.01 {
-			currentDebts[i].RemainingBalance = 0
+		currentDebts[i].RemainingBalanceCents -= extraPaymentInOriginalCurrencyCents
+		availableCashEURCents -= extraPaymentEURCents
+		totalDebtPaidEURCents += extraPaymentEURCents
+
+		if currentDebts[i].RemainingBalanceCents <= 0 {
+			currentDebts[i].RemainingBalanceCents = 0
 			currentDebts[i].Status = DebtStatusPaid
 		}
 	}
 
-	projection.DebtPaymentsEUR = totalDebtPaidEUR
-	projection.FreeCashflowEUR = availableCashEUR
+	projection.DebtPaymentsEURCents = totalDebtPaidEURCents
+	projection.FreeCashflowEURCents = availableCashEURCents
 	projection.EndMonthDebtStates = currentDebts
 
 	return projection, currentDebts

@@ -193,19 +193,19 @@ func (s *Server) handleSimulateCashflow(w http.ResponseWriter, r *http.Request) 
 	states := make([]finance.DebtPayoffState, len(activeDebts))
 	for i, d := range activeDebts {
 		acc, _ := s.repo.GetAccountByID(r.Context(), d.AccountID)
-		balance := d.OriginalAmount
-		if acc != nil && acc.CurrentBalance < 0 {
-			balance = -acc.CurrentBalance
+		balanceCents := d.OriginalAmountCents
+		if acc != nil && acc.CurrentBalanceCents < 0 {
+			balanceCents = -acc.CurrentBalanceCents
 		}
 
 		states[i] = finance.DebtPayoffState{
-			AccountID:            d.AccountID,
-			CreditorName:         d.CreditorName,
-			Priority:             d.Priority,
-			OriginalCurrency:     d.OriginalCurrency,
-			RemainingBalance:     balance,
-			MinMonthlyPaymentUAH: d.MinMonthlyPaymentUAH,
-			Status:               d.Status,
+			AccountID:                 d.AccountID,
+			CreditorName:              d.CreditorName,
+			Priority:                  d.Priority,
+			OriginalCurrency:          d.OriginalCurrency,
+			RemainingBalanceCents:     balanceCents,
+			MinMonthlyPaymentUAHCents: d.MinMonthlyPaymentUAHCents,
+			Status:                    d.Status,
 		}
 	}
 

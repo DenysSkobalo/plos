@@ -19,5 +19,6 @@ type Repository interface {
 
 	// Transactions
 	CreateTransaction(ctx context.Context, tx *Transaction) error
+	ProcessTransaction(ctx context.Context, tx *Transaction) error
 	GetTransactions(ctx context.Context, limit int) ([]Transaction, error)
 }

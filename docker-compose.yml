@@ -1,14 +1,18 @@
 services:
-  plos:
+  backend:
     build:
       context: .
       dockerfile: Dockerfile
-    container_name: plos_app
+    container_name: plos-backend
     ports:
       - "8080:8080"
-    volumes:
-      - ./data:/app/data
     environment:
       - PORT=8080
-      - DB_PATH=/app/data/finance.db
+      - DB_PATH=/app/data/plos.db
+    volumes:
+      - ./data:/app/data
     restart: unless-stopped
+
+volumes:
+  plos_db_data:
+    driver: local

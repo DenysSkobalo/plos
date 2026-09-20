@@ -1,29 +1,35 @@
-# Stage 1: Build Svelte 5 Frontend
-FROM node:20-alpine AS frontend-builder
-WORKDIR /app/web
-COPY web/package*.json ./
-RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
-COPY web/ ./
-RUN npm run build
+# Stage 1: Build binary
+FROM golang:1.25-alpine AS builder
 
-# Stage 2: Build CGO-free Go Binary with Embedded Assets
-FROM golang:1.25-alpine AS backend-builder
+RUN apk add --no-cache gcc musl-dev
+
 WORKDIR /app
+
 COPY go.mod go.sum ./
 RUN go mod download
+
 COPY . .
-COPY --from=frontend-builder /app/web/dist ./web/dist
-RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/plos ./cmd/server/main.go
 
-# Stage 3: Minimal Alpine Runtime
+# Static linking for CGO (SQLite) on Alpine
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -ldflags="-s -w -extldflags '-static'" \
+    -o /app/bin/server ./cmd/server
+
+# Stage 2: Runtime image
 FROM alpine:3.20
-RUN apk add --no-cache ca-certificates tzdata
-WORKDIR /app
-COPY --from=backend-builder /app/plos /app/plos
 
+RUN apk add --no-cache ca-certificates tzdata
+
+WORKDIR /app
+
+COPY --from=builder /app/bin/server /app/server
+
+# Local database persistence layer
 RUN mkdir -p /app/data
-VOLUME ["/app/data"]
+
+ENV PORT=8080
+ENV DB_PATH=/app/data/plos.db
 
 EXPOSE 8080
-ENV DB_PATH=/app/data/finance.db
-ENTRYPOINT ["/app/plos"]
+
+ENTRYPOINT ["/app/server"]

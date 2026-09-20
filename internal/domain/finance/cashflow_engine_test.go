@@ -7,42 +7,38 @@ import (
 func TestCashflowEngine_SimulateCascadePayoff(t *testing.T) {
 	engine := NewCashflowEngine()
 
-	buyRate := 51.0700 // Monobank EUR/UAH
+	buyRate := 51.0700
 
 	incomes := []IncomeItem{
-		{Name: "Salary September", Amount: 1230.00, Currency: "EUR"},
+		{Name: "Salary September", AmountCents: 123000, Currency: "EUR"},
 	}
 
 	expenses := []ExpenseItem{
-		{Name: "Mobile", Amount: 12.20, Currency: "EUR"},
-		{Name: "TCL Pass", Amount: 20.50, Currency: "EUR"},
+		{Name: "Mobile", AmountCents: 1220, Currency: "EUR"},
+		{Name: "TCL Pass", AmountCents: 2050, Currency: "EUR"},
 	}
 
 	debts := []DebtPayoffState{
-		{AccountID: "d1", CreditorName: "Moneyveo", Priority: 1, OriginalCurrency: "UAH", RemainingBalance: 7721.92, MinMonthlyPaymentUAH: 7721.92, Status: DebtStatusOverdue},
-		{AccountID: "d2", CreditorName: "Monobank", Priority: 2, OriginalCurrency: "UAH", RemainingBalance: 20918.41, MinMonthlyPaymentUAH: 1950.96, Status: DebtStatusActive},
-		{AccountID: "d3", CreditorName: "BasicFit", Priority: 3, OriginalCurrency: "EUR", RemainingBalance: 74.97, MinMonthlyPaymentUAH: 74.97, Status: DebtStatusActive},
+		{AccountID: "d1", CreditorName: "Moneyveo", Priority: 1, OriginalCurrency: "UAH", RemainingBalanceCents: 772192, MinMonthlyPaymentUAHCents: 772192, Status: DebtStatusOverdue},
+		{AccountID: "d2", CreditorName: "Monobank", Priority: 2, OriginalCurrency: "UAH", RemainingBalanceCents: 2091841, MinMonthlyPaymentUAHCents: 195096, Status: DebtStatusActive},
+		{AccountID: "d3", CreditorName: "BasicFit", Priority: 3, OriginalCurrency: "EUR", RemainingBalanceCents: 7497, MinMonthlyPaymentUAHCents: 7497, Status: DebtStatusActive},
 	}
 
-	// Симуляція першого місяця
 	projection, updatedDebts := engine.SimulateMonth("2026-09", incomes, expenses, debts, buyRate)
 
-	// 1. Перевірка покриття P1 (Moneyveo) та P3 (BasicFit) повністю
-	if updatedDebts[0].Status != DebtStatusPaid || updatedDebts[0].RemainingBalance != 0 {
-		t.Errorf("expected P1 Moneyveo to be PAID, got balance %f status %s", updatedDebts[0].RemainingBalance, updatedDebts[0].Status)
+	if updatedDebts[0].Status != DebtStatusPaid || updatedDebts[0].RemainingBalanceCents != 0 {
+		t.Errorf("expected P1 Moneyveo to be PAID, got balance %d status %s", updatedDebts[0].RemainingBalanceCents, updatedDebts[0].Status)
 	}
 
-	if updatedDebts[2].Status != DebtStatusPaid || updatedDebts[2].RemainingBalance != 0 {
-		t.Errorf("expected P3 BasicFit to be PAID, got balance %f status %s", updatedDebts[2].RemainingBalance, updatedDebts[2].Status)
+	if updatedDebts[2].Status != DebtStatusPaid || updatedDebts[2].RemainingBalanceCents != 0 {
+		t.Errorf("expected P3 BasicFit to be PAID, got balance %d status %s", updatedDebts[2].RemainingBalanceCents, updatedDebts[2].Status)
 	}
 
-	// 2. Перевірка часткового погашення P2 (Monobank)
-	if updatedDebts[1].RemainingBalance >= 20918.41 {
-		t.Errorf("expected P2 Monobank balance to decrease, got %f", updatedDebts[1].RemainingBalance)
+	if updatedDebts[1].RemainingBalanceCents >= 2091841 {
+		t.Errorf("expected P2 Monobank balance to decrease, got %d", updatedDebts[1].RemainingBalanceCents)
 	}
 
-	// 3. Перевірка позитивного чистого залишку вільного кешу
-	if projection.FreeCashflowEUR <= 0 {
-		t.Errorf("expected positive free cashflow, got %f", projection.FreeCashflowEUR)
+	if projection.FreeCashflowEURCents <= 0 {
+		t.Errorf("expected positive free cashflow, got %d", projection.FreeCashflowEURCents)
 	}
 }

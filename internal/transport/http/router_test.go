@@ -65,12 +65,12 @@ func TestHTTP_AccountAndDebtEndpoints(t *testing.T) {
 	_ = server.repo.AddCurrency(ctx, finance.Currency{Code: "UAH", Symbol: "₴"})
 
 	acc := finance.Account{
-		ID:             "acc-1",
-		Name:           "Monobank Overdraft",
-		Type:           finance.AccountTypeDebt,
-		Currency:       "UAH",
-		InitialBalance: -20918.41,
-		CurrentBalance: -20918.41,
+		ID:                  "acc-1",
+		Name:                "Monobank Overdraft",
+		Type:                finance.AccountTypeDebt,
+		Currency:            "UAH",
+		InitialBalanceCents: -2091841,
+		CurrentBalanceCents: -2091841,
 	}
 	body, _ := json.Marshal(acc)
 
@@ -84,13 +84,13 @@ func TestHTTP_AccountAndDebtEndpoints(t *testing.T) {
 	}
 
 	meta := finance.DebtMetadata{
-		AccountID:            "acc-1",
-		Priority:             2,
-		CreditorName:         "Monobank",
-		OriginalCurrency:     "UAH",
-		OriginalAmount:       20918.41,
-		MinMonthlyPaymentUAH: 1950.96,
-		Status:               finance.DebtStatusActive,
+		AccountID:                 "acc-1",
+		Priority:                  2,
+		CreditorName:              "Monobank",
+		OriginalCurrency:          "UAH",
+		OriginalAmountCents:       2091841,
+		MinMonthlyPaymentUAHCents: 195096,
+		Status:                    finance.DebtStatusActive,
 	}
 	metaBody, _ := json.Marshal(meta)
 

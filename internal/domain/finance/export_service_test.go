@@ -16,23 +16,23 @@ func TestExportService_ExportDebtsToCSV(t *testing.T) {
 	_ = repo.AddCurrency(ctx, Currency{Code: "UAH", Symbol: "₴"})
 
 	acc := Account{
-		ID:             "d1",
-		Name:           "Moneyveo",
-		Type:           AccountTypeDebt,
-		Currency:       "UAH",
-		InitialBalance: -7721.92,
-		CurrentBalance: -7721.92,
+		ID:                  "d1",
+		Name:                "Moneyveo",
+		Type:                AccountTypeDebt,
+		Currency:            "UAH",
+		InitialBalanceCents: -772192,
+		CurrentBalanceCents: -772192,
 	}
 	_ = repo.CreateAccount(ctx, &acc)
 
 	debtMeta := DebtMetadata{
-		AccountID:            "d1",
-		Priority:             1,
-		CreditorName:         "Moneyveo",
-		OriginalCurrency:     "UAH",
-		OriginalAmount:       7721.92,
-		MinMonthlyPaymentUAH: 7721.92,
-		Status:               DebtStatusOverdue,
+		AccountID:                 "d1",
+		Priority:                  1,
+		CreditorName:              "Moneyveo",
+		OriginalCurrency:          "UAH",
+		OriginalAmountCents:       772192,
+		MinMonthlyPaymentUAHCents: 772192,
+		Status:                    DebtStatusOverdue,
 	}
 	_ = repo.SetDebtMetadata(ctx, &debtMeta)
 

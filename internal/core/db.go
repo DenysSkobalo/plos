@@ -16,8 +16,9 @@ func InitDB(dbPath string) (*sql.DB, error) {
 		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
 	}
 
-	db.SetMaxOpenConns(1)
-	db.SetMaxIdleConns(1)
+	// WAL mode supports concurrent readers alongside a single writer.
+	db.SetMaxOpenConns(10)
+	db.SetMaxIdleConns(5)
 	db.SetConnMaxLifetime(0)
 	db.SetConnMaxIdleTime(5 * time.Minute)
 

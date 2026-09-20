@@ -48,7 +48,6 @@ func TestSQLiteRepository_CurrenciesAndAccounts(t *testing.T) {
 
 	ctx := context.Background()
 
-	// Усі 3 бази валюти (EUR, UAH, USD) ініціалізовані міграцією
 	currencies, err := repo.GetCurrencies(ctx)
 	if err != nil {
 		t.Fatalf("GetCurrencies failed: %v", err)
@@ -58,25 +57,25 @@ func TestSQLiteRepository_CurrenciesAndAccounts(t *testing.T) {
 	}
 
 	acc := Account{
-		ID:             "acc-mfo-1",
-		Name:           "Moneyveo",
-		Type:           AccountTypeDebt,
-		Currency:       "UAH",
-		InitialBalance: -7721.92,
-		CurrentBalance: -7721.92,
+		ID:                  "acc-mfo-1",
+		Name:                "Moneyveo",
+		Type:                AccountTypeDebt,
+		Currency:            "UAH",
+		InitialBalanceCents: -772192,
+		CurrentBalanceCents: -772192,
 	}
 	if err := repo.CreateAccount(ctx, &acc); err != nil {
 		t.Fatalf("CreateAccount failed: %v", err)
 	}
 
 	debtMeta := DebtMetadata{
-		AccountID:            acc.ID,
-		Priority:             1,
-		CreditorName:         "Moneyveo",
-		OriginalCurrency:     "UAH",
-		OriginalAmount:       7721.92,
-		MinMonthlyPaymentUAH: 7721.92,
-		Status:               DebtStatusOverdue,
+		AccountID:                 acc.ID,
+		Priority:                  1,
+		CreditorName:              "Moneyveo",
+		OriginalCurrency:          "UAH",
+		OriginalAmountCents:       772192,
+		MinMonthlyPaymentUAHCents: 772192,
+		Status:                    DebtStatusOverdue,
 	}
 	if err := repo.SetDebtMetadata(ctx, &debtMeta); err != nil {
 		t.Fatalf("SetDebtMetadata failed: %v", err)

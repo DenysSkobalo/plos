@@ -15,12 +15,10 @@ func NewExportService(repo Repository) *ExportService {
 	return &ExportService{repo: repo}
 }
 
-// ExportDebtsToCSV генерує CSV-файл із поточним станом боргів та їх пріоритетами.
 func (s *ExportService) ExportDebtsToCSV(ctx context.Context, w io.Writer) error {
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
 
-	// RFC 4180 Header
 	header := []string{
 		"Priority",
 		"Creditor",
@@ -42,9 +40,9 @@ func (s *ExportService) ExportDebtsToCSV(ctx context.Context, w io.Writer) error
 
 	for _, d := range debts {
 		acc, err := s.repo.GetAccountByID(ctx, d.AccountID)
-		currentBalance := 0.0
+		currentBalanceCents := int64(0)
 		if err == nil && acc != nil {
-			currentBalance = acc.CurrentBalance
+			currentBalanceCents = acc.CurrentBalanceCents
 		}
 
 		deadline := ""
@@ -57,9 +55,9 @@ func (s *ExportService) ExportDebtsToCSV(ctx context.Context, w io.Writer) error
 			d.CreditorName,
 			string(d.Status),
 			d.OriginalCurrency,
-			fmt.Sprintf("%.2f", d.OriginalAmount),
-			fmt.Sprintf("%.2f", currentBalance),
-			fmt.Sprintf("%.2f", d.MinMonthlyPaymentUAH),
+			fmt.Sprintf("%.2f", float64(d.OriginalAmountCents)/100.0),
+			fmt.Sprintf("%.2f", float64(currentBalanceCents)/100.0),
+			fmt.Sprintf("%.2f", float64(d.MinMonthlyPaymentUAHCents)/100.0),
 			deadline,
 		}
 
@@ -71,7 +69,6 @@ func (s *ExportService) ExportDebtsToCSV(ctx context.Context, w io.Writer) error
 	return nil
 }
 
-// ExportTransactionsToCSV генерує CSV-файл списку фінансових транзакцій.
 func (s *ExportService) ExportTransactionsToCSV(ctx context.Context, w io.Writer, limit int) error {
 	writer := csv.NewWriter(w)
 	defer writer.Flush()
@@ -110,7 +107,7 @@ func (s *ExportService) ExportTransactionsToCSV(ctx context.Context, w io.Writer
 			tx.ExecutionDate,
 			sourceAcc,
 			destAcc,
-			fmt.Sprintf("%.2f", tx.Amount),
+			fmt.Sprintf("%.2f", float64(tx.AmountCents)/100.0),
 			tx.Currency,
 			fmt.Sprintf("%.4f", tx.ExchangeRateApplied),
 			tx.Description,
