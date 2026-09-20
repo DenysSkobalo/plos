@@ -1,0 +1,156 @@
+\documentclass[11pt,a4paper]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{hyperref}
+\usepackage{booktabs}
+\usepackage{longtable}
+\usepackage{array}
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows.meta, positioning}
+
+\title{\textbf{Technical Engine Specification: PLOS Backend}}
+\author{\textbf{PLOS Core Architecture Team}}
+\date{September 2026}
+
+\begin{document}
+
+\maketitle
+
+\section{System Architecture Overview}
+
+The PLOS backend is engineered following the Clean/Hexagonal Architecture pattern, enforcing a strict separation of concerns across software layers. The entire system is compiled into a single, static CGO-free binary targeting \textbf{Go 1.25.0}.
+
+\begin{figure}[htbp]
+\centering
+\begin{tikzpicture}[node distance=1.2cm, auto, >=Stealth]
+    \tikzstyle{block} = [draw, fill=blue!10, rectangle, minimum height=2.2em, minimum width=12em, rounded corners, align=center]
+    \tikzstyle{layer} = [draw, fill=gray!5, rectangle, minimum height=2.8em, minimum width=24em, rounded corners, align=center]
+
+    \node [block] (client) {HTTP Client / SPA Frontend};
+    \node [layer, below=of client] (transport) {\textbf{Transport Layer} (\texttt{internal/transport/http})\\Chi Mux, Middleware, Embedded Static FS};
+    \node [layer, below=of transport] (domain) {\textbf{Domain Services \& Pure Engine} (\texttt{internal/domain/finance})\\Cashflow Engine, Rate Service, Export Service};
+    \node [layer, below=of domain] (repo) {\textbf{Domain Data Layer}\\Repository Interface \& SQLite Implementation};
+    \node [layer, below=of repo] (core) {\textbf{Core Infrastructure Layer} (\texttt{internal/core})\\SQLite Init (CGO-Free), Pragmas, Embedded Migrator};
+
+    \draw[->, thick] (client) -- (transport);
+    \draw[->, thick] (transport) -- (domain);
+    \draw[->, thick] (domain) -- (repo);
+    \draw[->, thick] (repo) -- (core);
+\end{tikzpicture}
+\caption{PLOS Backend Hexagonal Architecture Execution Pipeline.}
+\end{figure}
+
+\subsection{Package Domain Responsibilities}
+
+\noindent\begin{longtable}{@{\extracolsep{\fill}} l l p{7.5cm} @{}}
+\toprule
+\textbf{Package} & \textbf{Domain Area} & \textbf{Mechanical Purpose} \\ \midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{cmd/server} & Application Entrypoint & Initializes logger (\texttt{slog}), configuration, database pools, migrator, and HTTP server with graceful shutdown handling. \\
+\texttt{internal/config} & Configuration & Loads runtime environment variables (\texttt{DB\_PATH}). \\
+\texttt{internal/core} & Storage Infrastructure & Manages CGO-free SQLite initialization, SQLite Pragmas, and transactional migration execution. \\
+\texttt{internal/domain/finance} & Domain Models \& Logic & Defines domain entities, Repository contracts, SQLite repository, Rate service, and deterministic Cashflow Engine. \\
+\texttt{internal/transport/http} & Transport / REST API & REST endpoints via \texttt{chi.Mux}, JSON serialization, request validation, and error handling. \\
+\texttt{migrations} & Database Schemas & Versioned SQL migration files embedded directly into the binary using \texttt{embed.FS}. \\
+\texttt{web} & Static Assets Integration & Holds embedded filesystem (\texttt{embed.FS}) of compiled frontend assets (\texttt{web/dist}). \\
+\caption{Package responsibilities and layer bounds.}
+\end{longtable}
+
+\section{System Level \& Storage Subsystem Mechanics}
+
+\subsection{CGO-Free SQLite Driver \& Database Connection Pool}
+
+The system utilizes \texttt{modernc.org/sqlite}, a pure Go SQLite implementation created via C-to-Go transpilation. This eliminates runtime dependencies on CGO, enabling true cross-platform \texttt{CGO\_ENABLED=0} static compilation and removing context-switching overhead between the Go goroutine stack and the C execution stack.
+
+The connection pool is intentionally restricted to prevent file-level lock contention:
+\begin{equation}
+\text{MaxOpenConns} = 1, \quad \text{MaxIdleConns} = 1, \quad \text{ConnMaxIdleTime} = 5\text{ minutes}
+\end{equation}
+
+Restricting SQLite writes to a single open connection serializes write operations at the application level, completely preventing \texttt{SQLITE\_BUSY} lock errors.
+
+\subsection{SQLite Hardware Sympathy Configuration (Pragmas)}
+
+The database is initialized using optimal SQLite Pragmas tuned for SSD/NVMe storage mechanics:
+\begin{itemize}
+    \item \texttt{journal\_mode(WAL)}: Enables Write-Ahead Logging. Readers do not block writers, and writers do not block readers, achieving concurrent execution throughput.
+    \item \texttt{synchronous(NORMAL)}: Eliminates unnecessary \texttt{fsync()} system calls on every transaction commit, syncing only during WAL checkpointing.
+    \item \texttt{busy\_timeout(5000)}: Enforces an internal 5000ms retry backoff loop when lock contention occurs.
+    \item \texttt{foreign\_keys(1)}: Enforces relational foreign key constraints on every mutation.
+\end{itemize}
+
+\section{Cashflow Engine Mechanics}
+
+The \texttt{CashflowEngine} is a pure, deterministic domain engine free from I/O dependencies or system calls.
+
+\subsection{Mathematical Model of the Two-Phase Cascade Algorithm}
+
+Let the exchange rate for EUR/UAH be $R_{\text{buy}}$. Foreign currency amounts are normalized to the base currency (EUR):
+\begin{equation}
+\text{Amount}_{\text{EUR}} = 
+\begin{cases} 
+\text{Amount}, & \text{if Currency} = \text{EUR} \\ 
+\frac{\text{Amount}}{R_{\text{buy}}}, & \text{if Currency} = \text{UAH} 
+\end{cases}
+\end{equation}
+
+The total available liquidity for the monthly period is calculated as:
+\begin{equation}
+C_{\text{avail}} = \sum \text{Income}_{\text{EUR}} - \sum \text{Expense}_{\text{EUR}}
+\end{equation}
+
+\subsubsection{Phase A: Mandatory Minimum Payments}
+For each active debt $d_i \in D$, the mandatory minimum payment is applied regardless of priority:
+\begin{equation}
+P_{\text{min}, i} = \min\left(\text{MinPayment}_{\text{EUR}}(d_i), \text{Remaining}_{\text{EUR}}(d_i), C_{\text{avail}}\right)
+\end{equation}
+\begin{equation}
+\text{Remaining}_{\text{EUR}}(d_i) \leftarrow \text{Remaining}_{\text{EUR}}(d_i) - P_{\text{min}, i}
+\end{equation}
+\begin{equation}
+C_{\text{avail}} \leftarrow C_{\text{avail}} - P_{\text{min}, i}
+\end{equation}
+
+\subsubsection{Phase B: Cascade Priority Surplus Distribution}
+Iterating through active debts sorted in strict priority order ($P_1 \to P_n$), remaining available liquidity $C_{\text{avail}}$ is cascaded:
+\begin{equation}
+P_{\text{extra}, k} = \min\left(C_{\text{avail}}, \text{Remaining}_{\text{EUR}}(d_k)\right)
+\end{equation}
+\begin{equation}
+\text{Remaining}_{\text{EUR}}(d_k) \leftarrow \text{Remaining}_{\text{EUR}}(d_k) - P_{\text{extra}, k}
+\end{equation}
+\begin{equation}
+C_{\text{avail}} \leftarrow C_{\text{avail}} - P_{\text{extra}, k}
+\end{equation}
+
+To avoid floating-point representation anomalies ($\epsilon$-precision errors):
+\begin{equation}
+\forall d_i \in D, \quad \text{if } \text{Remaining}_{\text{EUR}}(d_i) \le 0.01 \implies \text{Remaining}(d_i) = 0, \quad \text{Status}(d_i) = \text{PAID}
+\end{equation}
+
+\section{REST API Specification}
+
+\noindent\begin{longtable}{@{\extracolsep{\fill}} l l l p{5.5cm} @{}}
+\toprule
+\textbf{HTTP Method} & \textbf{Endpoint Path} & \textbf{Status Code} & \textbf{Description / Purpose} \\ \midrule
+\endhead
+\bottomrule
+\endfoot
+\texttt{GET} & \texttt{/api/v1/currencies} & \texttt{200 OK} & Fetch supported ISO currencies. \\
+\texttt{POST} & \texttt{/api/v1/currencies} & \texttt{201 Created} & Register a new ISO currency reference. \\
+\texttt{GET} & \texttt{/api/v1/rates} & \texttt{200 OK} & Query latest exchange rates. \\
+\texttt{POST} & \texttt{/api/v1/rates/sync} & \texttt{200 OK} & Trigger rate sync via Monobank Public API. \\
+\texttt{POST} & \texttt{/api/v1/rates/manual} & \texttt{200 OK} & Set manual rate override. \\
+\texttt{GET} & \texttt{/api/v1/accounts} & \texttt{200 OK} & Retrieve financial accounts list. \\
+\texttt{POST} & \texttt{/api/v1/accounts} & \texttt{201 Created} & Create new financial account/category. \\
+\texttt{GET} & \texttt{/api/v1/debts} & \texttt{200 OK} & Get active debts ordered by priority ($P_1 \to P_n$). \\
+\texttt{POST} & \texttt{/api/v1/debts} & \texttt{200 OK} & Upsert debt metadata attributes. \\
+\texttt{POST} & \texttt{/api/v1/cashflow/simulate} & \texttt{200 OK} & Run one-step cascade payoff simulation. \\
+\texttt{GET} & \texttt{/api/v1/export/debts.csv} & \texttt{200 OK} & Export active debts as RFC 4180 CSV stream. \\
+\caption{API Route Index and Endpoint Definitions.}
+\end{longtable}
+
+\end{document}
