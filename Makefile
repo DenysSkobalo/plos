@@ -1,12 +1,23 @@
-.PHONY: build run dev-backend dev-frontend test clean
+.PHONY: fmt vet lint test check build run dev-backend dev-frontend clean
 
 BINARY_NAME=app
 SERVER_PATH=./cmd/server/main.go
 
-build:
-	@echo "Building frontend..."
-	cd web && npm run build
-	@echo "Building backend..."
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+lint:
+	golangci-lint run ./...
+
+test:
+	go test -v -race -cover ./...
+
+check: fmt vet lint test
+
+build: check
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/$(BINARY_NAME) $(SERVER_PATH)
 
 run: build
@@ -17,9 +28,6 @@ dev-backend:
 
 dev-frontend:
 	cd web && npm run dev
-
-test:
-	go test -v -race ./...
 
 clean:
 	rm -rf bin/ web/dist data/*.db*
