@@ -1,0 +1,35 @@
+# Local SQLite Storage & WAL files
+/data/*
+!/data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
+# Go Binaries & Cache
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Node.js / Frontend
+/web/node_modules/
+/web/dist/
+/web/.svelte-kit/
+/web/.vite/
+.npm
+*.log
+
+# Environment & Local Secrets
+.env
+.env.local
+*.pem
+
+# IDEs & System files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
