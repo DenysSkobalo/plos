@@ -7,7 +7,7 @@ COPY web/ ./
 RUN npm run build
 
 # Stage 2: Build CGO-free Go Binary with Embedded Assets
-FROM golang:1.23-alpine AS backend-builder
+FROM golang:1.25-alpine AS backend-builder
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
