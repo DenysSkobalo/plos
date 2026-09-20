@@ -2,7 +2,7 @@
 FROM node:20-alpine AS frontend-builder
 WORKDIR /app/web
 COPY web/package*.json ./
-RUN npm ci
+RUN if [ -f package-lock.json ]; then npm ci; else npm install; fi
 COPY web/ ./
 RUN npm run build
 
@@ -15,7 +15,7 @@ COPY . .
 COPY --from=frontend-builder /app/web/dist ./web/dist
 RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/plos ./cmd/server/main.go
 
-# Stage 3: Minimal Scratch/Alpine Runtime
+# Stage 3: Minimal Alpine Runtime
 FROM alpine:3.20
 RUN apk add --no-cache ca-certificates tzdata
 WORKDIR /app
