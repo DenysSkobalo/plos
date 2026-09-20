@@ -1,0 +1,2457 @@
+--- File: ./cmd/server/testdata/migrations/000001_init_finance.sql ---
+-- Schema Versioning Tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Currencies
+CREATE TABLE IF NOT EXISTS currencies (
+    code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL
+);
+
+-- Exchange Rates
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL, -- 'MONO', 'PUMB', 'MANUAL'
+    base_currency TEXT NOT NULL,
+    target_currency TEXT NOT NULL,
+    buy_rate REAL NOT NULL,
+    sell_rate REAL NOT NULL,
+    is_manual BOOLEAN NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (base_currency) REFERENCES currencies(code),
+    FOREIGN KEY (target_currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exchange_rates_lookup 
+ON exchange_rates(source, base_currency, target_currency, is_manual, updated_at DESC);
+
+-- Accounts & Debt Categories
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'INCOME_SOURCE', 'EXPENSE_CATEGORY', 'DEBT', 'ASSET'
+    currency TEXT NOT NULL,
+    initial_balance REAL DEFAULT 0.0,
+    current_balance REAL DEFAULT 0.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+-- Debt Metadata (Cascade Payoff Attributes)
+CREATE TABLE IF NOT EXISTS debt_metadata (
+    account_id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    creditor_name TEXT NOT NULL,
+    original_currency TEXT NOT NULL,
+    original_amount REAL NOT NULL,
+    min_monthly_payment_uah REAL NOT NULL,
+    deadline_date TEXT,
+    status TEXT NOT NULL, -- 'OVERDUE', 'ACTIVE', 'PAID'
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (original_currency) REFERENCES currencies(code)
+);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    source_account_id TEXT,
+    destination_account_id TEXT,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    exchange_rate_applied REAL DEFAULT 1.0,
+    description TEXT,
+    execution_date TEXT NOT NULL, -- YYYY-MM-DD
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (destination_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_execution_date 
+ON transactions(execution_date DESC);
+
+
+--- File: ./cmd/server/main.go ---
+package main
+
+import (
+	"context"
+	"embed"
+	"errors"
+	"io/fs"
+	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/go-chi/chi/v5"
+
+	"plos/internal/config"
+	"plos/internal/core"
+	"plos/internal/domain/finance"
+	transportHTTP "plos/internal/transport/http"
+)
+
+//go:embed all:web/dist
+var webDistFS embed.FS
+
+//go:embed migrations/*.sql
+var migrationsFS embed.FS
+
+func main() {
+	logger := slog.New(slog.NewJSONHandler(os.Stdout, nil))
+
+	cfg := config.Load()
+
+	if err := os.MkdirAll(filepath.Dir(cfg.DBPath), 0755); err != nil {
+		logger.Error("failed to create data directory", "error", err)
+		os.Exit(1)
+	}
+
+	db, err := core.InitDB(cfg.DBPath)
+	if err != nil {
+		logger.Error("failed to initialize db", "error", err)
+		os.Exit(1)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := core.RunMigrations(db, migrationsFS, "migrations"); err != nil {
+		logger.Error("failed to run migrations", "error", err)
+		os.Exit(1)
+	}
+
+	repo := finance.NewSQLiteRepository(db)
+	rateService := finance.NewRateService(repo, nil)
+	engine := finance.NewCashflowEngine()
+	exportService := finance.NewExportService(repo)
+
+	apiServer := transportHTTP.NewServer(repo, rateService, engine, exportService)
+
+	router, ok := apiServer.Router().(*chi.Mux)
+	if !ok {
+		logger.Error("failed to typecast router to chi.Mux")
+		os.Exit(1)
+	}
+
+	// SPA Router Middleware for embedded static assets
+	distSubFS, err := fs.Sub(webDistFS, "web/dist")
+	if err == nil {
+		fileServer := http.FileServer(http.FS(distSubFS))
+		router.NotFound(func(w http.ResponseWriter, r *http.Request) {
+			if strings.HasPrefix(r.URL.Path, "/api") {
+				http.NotFound(w, r)
+				return
+			}
+
+			f, openErr := distSubFS.Open(strings.TrimPrefix(r.URL.Path, "/"))
+			if openErr != nil {
+				r.URL.Path = "/"
+			} else {
+				_ = f.Close()
+			}
+			fileServer.ServeHTTP(w, r)
+		})
+	}
+
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
+	}
+
+	srv := &http.Server{
+		Addr:         ":" + port,
+		Handler:      router,
+		ReadTimeout:  10 * time.Second,
+		WriteTimeout: 30 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+
+	go func() {
+		logger.Info("server started", "port", port)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Error("http server failed", "error", err)
+		}
+	}()
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	<-stop
+
+	logger.Info("shutting down server...")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	if err := srv.Shutdown(ctx); err != nil {
+		logger.Error("server forced to shutdown", "error", err)
+	}
+
+	logger.Info("server stopped gracefully")
+}
+
+
+--- File: ./cmd/server/main_test.go ---
+package main
+
+import (
+	"context"
+	"embed"
+	"net/http"
+	"os"
+	"testing"
+	"time"
+
+	"plos/internal/core"
+	"plos/internal/domain/finance"
+	transportHTTP "plos/internal/transport/http"
+)
+
+//go:embed testdata/migrations/*.sql
+var testMigrationsFS embed.FS
+
+func TestServer_BootAndShutdown(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "test_main_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	_ = tmpFile.Close()
+
+	db, err := core.InitDB(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := core.RunMigrations(db, testMigrationsFS, "testdata/migrations"); err != nil {
+		t.Fatalf("RunMigrations failed: %v", err)
+	}
+
+	repo := finance.NewSQLiteRepository(db)
+	rateService := finance.NewRateService(repo, nil)
+	engine := finance.NewCashflowEngine()
+	exportService := finance.NewExportService(repo)
+
+	server := transportHTTP.NewServer(repo, rateService, engine, exportService)
+
+	httpServer := &http.Server{
+		Addr:    "127.0.0.1:0",
+		Handler: server.Router(),
+	}
+
+	go func() {
+		_ = httpServer.ListenAndServe()
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	if err := httpServer.Shutdown(ctx); err != nil {
+		t.Fatalf("HTTP server shutdown failed: %v", err)
+	}
+}
+
+
+--- File: ./migrations/000001_init_finance.sql ---
+-- Schema Versioning Tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Currencies
+CREATE TABLE IF NOT EXISTS currencies (
+    code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL
+);
+
+-- Exchange Rates
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL, -- 'MONO', 'PUMB', 'MANUAL'
+    base_currency TEXT NOT NULL,
+    target_currency TEXT NOT NULL,
+    buy_rate REAL NOT NULL,
+    sell_rate REAL NOT NULL,
+    is_manual BOOLEAN NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (base_currency) REFERENCES currencies(code),
+    FOREIGN KEY (target_currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exchange_rates_lookup 
+ON exchange_rates(source, base_currency, target_currency, is_manual, updated_at DESC);
+
+-- Accounts & Debt Categories
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'INCOME_SOURCE', 'EXPENSE_CATEGORY', 'DEBT', 'ASSET'
+    currency TEXT NOT NULL,
+    initial_balance REAL DEFAULT 0.0,
+    current_balance REAL DEFAULT 0.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+-- Debt Metadata (Cascade Payoff Attributes)
+CREATE TABLE IF NOT EXISTS debt_metadata (
+    account_id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    creditor_name TEXT NOT NULL,
+    original_currency TEXT NOT NULL,
+    original_amount REAL NOT NULL,
+    min_monthly_payment_uah REAL NOT NULL,
+    deadline_date TEXT,
+    status TEXT NOT NULL, -- 'OVERDUE', 'ACTIVE', 'PAID'
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (original_currency) REFERENCES currencies(code)
+);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    source_account_id TEXT,
+    destination_account_id TEXT,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    exchange_rate_applied REAL DEFAULT 1.0,
+    description TEXT,
+    execution_date TEXT NOT NULL, -- YYYY-MM-DD
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (destination_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_execution_date 
+ON transactions(execution_date DESC);
+
+
+--- File: ./go.mod ---
+module plos
+
+go 1.26.6
+
+require (
+	github.com/go-chi/chi/v5 v5.3.2
+	modernc.org/sqlite v1.59.0
+)
+
+require (
+	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/google/uuid v1.6.0 // indirect
+	github.com/mattn/go-isatty v0.0.24 // indirect
+	github.com/ncruces/go-strftime v1.0.0 // indirect
+	github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	modernc.org/libc v1.75.7 // indirect
+	modernc.org/mathutil v1.7.1 // indirect
+	modernc.org/memory v1.12.1 // indirect
+)
+
+
+--- File: ./Dockerfile ---
+# Stage 1: Build Svelte 5 Frontend
+FROM node:20-alpine AS frontend-builder
+WORKDIR /app/web
+COPY web/package*.json ./
+RUN npm ci
+COPY web/ ./
+RUN npm run build
+
+# Stage 2: Build CGO-free Go Binary with Embedded Assets
+FROM golang:1.23-alpine AS backend-builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+COPY --from=frontend-builder /app/web/dist ./web/dist
+RUN CGO_ENABLED=0 GOOS=linux go build -ldflags="-s -w" -o /app/plos ./cmd/server/main.go
+
+# Stage 3: Minimal Scratch/Alpine Runtime
+FROM alpine:3.20
+RUN apk add --no-cache ca-certificates tzdata
+WORKDIR /app
+COPY --from=backend-builder /app/plos /app/plos
+
+RUN mkdir -p /app/data
+VOLUME ["/app/data"]
+
+EXPOSE 8080
+ENV DB_PATH=/app/data/finance.db
+ENTRYPOINT ["/app/plos"]
+
+
+--- File: ./Makefile ---
+.PHONY: fmt vet lint test check build run dev-backend dev-frontend clean
+
+BINARY_NAME=app
+SERVER_PATH=./cmd/server/main.go
+
+fmt:
+	go fmt ./...
+
+vet:
+	go vet ./...
+
+lint:
+	golangci-lint run ./...
+
+test:
+	go test -v -race -cover ./...
+
+check: fmt vet lint test
+
+build: check
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/$(BINARY_NAME) $(SERVER_PATH)
+
+run: build
+	./bin/$(BINARY_NAME)
+
+dev-backend:
+	go run $(SERVER_PATH)
+
+dev-frontend:
+	cd web && npm run dev
+
+clean:
+	rm -rf bin/ web/dist data/*.db*
+
+
+--- File: ./web/dist/index.html ---
+<!DOCTYPE html>
+<html lang="en">
+<head><meta charset="UTF-8"><title>PLOS Engine</title></head>
+<body><div id="app">PLOS Engine Ready</div></body>
+</html>
+
+
+--- File: ./internal/transport/http/testdata/migrations/000001_init_finance.sql ---
+-- Schema Versioning Tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Currencies
+CREATE TABLE IF NOT EXISTS currencies (
+    code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL
+);
+
+-- Exchange Rates
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL, -- 'MONO', 'PUMB', 'MANUAL'
+    base_currency TEXT NOT NULL,
+    target_currency TEXT NOT NULL,
+    buy_rate REAL NOT NULL,
+    sell_rate REAL NOT NULL,
+    is_manual BOOLEAN NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (base_currency) REFERENCES currencies(code),
+    FOREIGN KEY (target_currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exchange_rates_lookup 
+ON exchange_rates(source, base_currency, target_currency, is_manual, updated_at DESC);
+
+-- Accounts & Debt Categories
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'INCOME_SOURCE', 'EXPENSE_CATEGORY', 'DEBT', 'ASSET'
+    currency TEXT NOT NULL,
+    initial_balance REAL DEFAULT 0.0,
+    current_balance REAL DEFAULT 0.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+-- Debt Metadata (Cascade Payoff Attributes)
+CREATE TABLE IF NOT EXISTS debt_metadata (
+    account_id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    creditor_name TEXT NOT NULL,
+    original_currency TEXT NOT NULL,
+    original_amount REAL NOT NULL,
+    min_monthly_payment_uah REAL NOT NULL,
+    deadline_date TEXT,
+    status TEXT NOT NULL, -- 'OVERDUE', 'ACTIVE', 'PAID'
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (original_currency) REFERENCES currencies(code)
+);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    source_account_id TEXT,
+    destination_account_id TEXT,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    exchange_rate_applied REAL DEFAULT 1.0,
+    description TEXT,
+    execution_date TEXT NOT NULL, -- YYYY-MM-DD
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (destination_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_execution_date 
+ON transactions(execution_date DESC);
+
+
+--- File: ./internal/transport/http/router_test.go ---
+package http
+
+import (
+	"bytes"
+	"context"
+	"embed"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+
+	"plos/internal/core"
+	"plos/internal/domain/finance"
+)
+
+//go:embed testdata/migrations/*.sql
+var testMigrationsFS embed.FS
+
+func setupTestServer(t *testing.T) (server *Server, cleanup func()) {
+	t.Helper()
+
+	tmpFile, err := os.CreateTemp("", "test_http_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db: %v", err)
+	}
+	_ = tmpFile.Close()
+
+	db, err := core.InitDB(tmpFile.Name())
+	if err != nil {
+		_ = os.Remove(tmpFile.Name())
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	if err := core.RunMigrations(db, testMigrationsFS, "testdata/migrations"); err != nil {
+		_ = db.Close()
+		_ = os.Remove(tmpFile.Name())
+		t.Fatalf("RunMigrations failed: %v", err)
+	}
+
+	repo := finance.NewSQLiteRepository(db)
+	rateService := finance.NewRateService(repo, nil)
+	engine := finance.NewCashflowEngine()
+	exportService := finance.NewExportService(repo)
+
+	server = NewServer(repo, rateService, engine, exportService)
+
+	cleanup = func() {
+		_ = db.Close()
+		_ = os.Remove(tmpFile.Name())
+	}
+
+	return server, cleanup
+}
+
+func TestHTTP_AccountAndDebtEndpoints(t *testing.T) {
+	server, cleanup := setupTestServer(t)
+	defer cleanup()
+
+	ts := httptest.NewServer(server.Router())
+	defer ts.Close()
+
+	ctx := context.Background()
+	_ = server.repo.AddCurrency(ctx, finance.Currency{Code: "EUR", Symbol: "€"})
+	_ = server.repo.AddCurrency(ctx, finance.Currency{Code: "UAH", Symbol: "₴"})
+
+	acc := finance.Account{
+		ID:             "acc-1",
+		Name:           "Monobank Overdraft",
+		Type:           finance.AccountTypeDebt,
+		Currency:       "UAH",
+		InitialBalance: -20918.41,
+		CurrentBalance: -20918.41,
+	}
+	body, _ := json.Marshal(acc)
+
+	resp, err := http.Post(ts.URL+"/api/v1/accounts", "application/json", bytes.NewBuffer(body))
+	if err != nil {
+		t.Fatalf("POST /api/v1/accounts failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		t.Errorf("expected 201 Created, got %d", resp.StatusCode)
+	}
+
+	meta := finance.DebtMetadata{
+		AccountID:            "acc-1",
+		Priority:             2,
+		CreditorName:         "Monobank",
+		OriginalCurrency:     "UAH",
+		OriginalAmount:       20918.41,
+		MinMonthlyPaymentUAH: 1950.96,
+		Status:               finance.DebtStatusActive,
+	}
+	metaBody, _ := json.Marshal(meta)
+
+	resp, err = http.Post(ts.URL+"/api/v1/debts", "application/json", bytes.NewBuffer(metaBody))
+	if err != nil {
+		t.Fatalf("POST /api/v1/debts failed: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	resp, err = http.Get(ts.URL + "/api/v1/debts")
+	if err != nil {
+		t.Fatalf("GET /api/v1/debts failed: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		_ = resp.Body.Close()
+		t.Errorf("expected 200 OK, got %d", resp.StatusCode)
+	}
+
+	var debts []finance.DebtMetadata
+	_ = json.NewDecoder(resp.Body).Decode(&debts)
+	_ = resp.Body.Close()
+
+	if len(debts) != 1 || debts[0].CreditorName != "Monobank" {
+		t.Errorf("unexpected debts response: %+v", debts)
+	}
+}
+
+
+--- File: ./internal/transport/http/router.go ---
+package http
+
+import (
+	"encoding/json"
+	"net/http"
+
+	"github.com/go-chi/chi/v5"
+	"github.com/go-chi/chi/v5/middleware"
+
+	"plos/internal/domain/finance"
+)
+
+type Server struct {
+	router        *chi.Mux
+	repo          finance.Repository
+	rateService   *finance.RateService
+	engine        *finance.CashflowEngine
+	exportService *finance.ExportService
+}
+
+func NewServer(
+	repo finance.Repository,
+	rateService *finance.RateService,
+	engine *finance.CashflowEngine,
+	exportService *finance.ExportService,
+) *Server {
+	s := &Server{
+		router:        chi.NewRouter(),
+		repo:          repo,
+		rateService:   rateService,
+		engine:        engine,
+		exportService: exportService,
+	}
+
+	s.routes()
+	return s
+}
+
+func (s *Server) Router() http.Handler {
+	return s.router
+}
+
+func (s *Server) routes() {
+	s.router.Use(middleware.RequestID)
+	s.router.Use(middleware.Logger)
+	s.router.Use(middleware.Recoverer)
+
+	s.router.Route("/api/v1", func(r chi.Router) {
+		r.Get("/rates", s.handleGetRates)
+		r.Post("/rates/sync", s.handleSyncRates)
+		r.Post("/rates/manual", s.handleSetManualRate)
+
+		r.Get("/accounts", s.handleGetAccounts)
+		r.Post("/accounts", s.handleCreateAccount)
+		r.Get("/debts", s.handleGetDebts)
+		r.Post("/debts", s.handleSetDebtMetadata)
+
+		r.Post("/cashflow/simulate", s.handleSimulateCashflow)
+
+		r.Get("/export/debts.csv", s.handleExportDebtsCSV)
+	})
+}
+
+func (s *Server) handleGetRates(w http.ResponseWriter, r *http.Request) {
+	rates, err := s.repo.GetLatestRates(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, rates)
+}
+
+func (s *Server) handleSyncRates(w http.ResponseWriter, r *http.Request) {
+	if err := s.rateService.SyncMonobankRates(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+type setManualRateRequest struct {
+	BaseCurrency   string  `json:"base_currency"`
+	TargetCurrency string  `json:"target_currency"`
+	BuyRate        float64 `json:"buy_rate"`
+	SellRate       float64 `json:"sell_rate"`
+}
+
+func (s *Server) handleSetManualRate(w http.ResponseWriter, r *http.Request) {
+	var req setManualRateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	err := s.rateService.SetManualRate(r.Context(), req.BaseCurrency, req.TargetCurrency, req.BuyRate, req.SellRate)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+func (s *Server) handleGetAccounts(w http.ResponseWriter, r *http.Request) {
+	accounts, err := s.repo.GetAccounts(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, accounts)
+}
+
+func (s *Server) handleCreateAccount(w http.ResponseWriter, r *http.Request) {
+	var acc finance.Account
+	if err := json.NewDecoder(r.Body).Decode(&acc); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.repo.CreateAccount(r.Context(), &acc); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+
+func (s *Server) handleGetDebts(w http.ResponseWriter, r *http.Request) {
+	debts, err := s.repo.GetActiveDebtsOrderedByPriority(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, debts)
+}
+
+func (s *Server) handleSetDebtMetadata(w http.ResponseWriter, r *http.Request) {
+	var meta finance.DebtMetadata
+	if err := json.NewDecoder(r.Body).Decode(&meta); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.repo.SetDebtMetadata(r.Context(), &meta); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+type cashflowSimulateRequest struct {
+	MonthName string                `json:"month_name"`
+	Incomes   []finance.IncomeItem  `json:"incomes"`
+	Expenses  []finance.ExpenseItem `json:"expenses"`
+	BuyRate   float64               `json:"buy_rate"`
+}
+
+func (s *Server) handleSimulateCashflow(w http.ResponseWriter, r *http.Request) {
+	var req cashflowSimulateRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	activeDebts, err := s.repo.GetActiveDebtsOrderedByPriority(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	states := make([]finance.DebtPayoffState, len(activeDebts))
+	for i, d := range activeDebts {
+		acc, _ := s.repo.GetAccountByID(r.Context(), d.AccountID)
+		balance := d.OriginalAmount
+		if acc != nil && acc.CurrentBalance < 0 {
+			balance = -acc.CurrentBalance
+		}
+
+		states[i] = finance.DebtPayoffState{
+			AccountID:            d.AccountID,
+			CreditorName:         d.CreditorName,
+			Priority:             d.Priority,
+			OriginalCurrency:     d.OriginalCurrency,
+			RemainingBalance:     balance,
+			MinMonthlyPaymentUAH: d.MinMonthlyPaymentUAH,
+			Status:               d.Status,
+		}
+	}
+
+	projection, _ := s.engine.SimulateMonth(req.MonthName, req.Incomes, req.Expenses, states, req.BuyRate)
+	respondJSON(w, http.StatusOK, projection)
+}
+
+func (s *Server) handleExportDebtsCSV(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/csv")
+	w.Header().Set("Content-Disposition", `attachment; filename="debts.csv"`)
+
+	if err := s.exportService.ExportDebtsToCSV(r.Context(), w); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+	}
+}
+
+func respondJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+
+--- File: ./internal/core/testdata/migrations/000001_init_finance.sql ---
+-- Schema Versioning Tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Currencies
+CREATE TABLE IF NOT EXISTS currencies (
+    code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL
+);
+
+-- Exchange Rates
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL, -- 'MONO', 'PUMB', 'MANUAL'
+    base_currency TEXT NOT NULL,
+    target_currency TEXT NOT NULL,
+    buy_rate REAL NOT NULL,
+    sell_rate REAL NOT NULL,
+    is_manual BOOLEAN NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (base_currency) REFERENCES currencies(code),
+    FOREIGN KEY (target_currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exchange_rates_lookup 
+ON exchange_rates(source, base_currency, target_currency, is_manual, updated_at DESC);
+
+-- Accounts & Debt Categories
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'INCOME_SOURCE', 'EXPENSE_CATEGORY', 'DEBT', 'ASSET'
+    currency TEXT NOT NULL,
+    initial_balance REAL DEFAULT 0.0,
+    current_balance REAL DEFAULT 0.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+-- Debt Metadata (Cascade Payoff Attributes)
+CREATE TABLE IF NOT EXISTS debt_metadata (
+    account_id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    creditor_name TEXT NOT NULL,
+    original_currency TEXT NOT NULL,
+    original_amount REAL NOT NULL,
+    min_monthly_payment_uah REAL NOT NULL,
+    deadline_date TEXT,
+    status TEXT NOT NULL, -- 'OVERDUE', 'ACTIVE', 'PAID'
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (original_currency) REFERENCES currencies(code)
+);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    source_account_id TEXT,
+    destination_account_id TEXT,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    exchange_rate_applied REAL DEFAULT 1.0,
+    description TEXT,
+    execution_date TEXT NOT NULL, -- YYYY-MM-DD
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (destination_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_execution_date 
+ON transactions(execution_date DESC);
+
+
+--- File: ./internal/core/db.go ---
+package core
+
+import (
+	"database/sql"
+	"fmt"
+	"time"
+
+	_ "modernc.org/sqlite"
+)
+
+func InitDB(dbPath string) (*sql.DB, error) {
+	dsn := fmt.Sprintf("%s?_pragma=foreign_keys(1)&_pragma=journal_mode(WAL)&_pragma=synchronous(NORMAL)&_pragma=busy_timeout(5000)", dbPath)
+
+	db, err := sql.Open("sqlite", dsn)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open sqlite database: %w", err)
+	}
+
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0)
+	db.SetConnMaxIdleTime(5 * time.Minute)
+
+	if err := db.Ping(); err != nil {
+		_ = db.Close()
+		return nil, fmt.Errorf("pinging sqlite database failed: %w", err)
+	}
+
+	return db, nil
+}
+
+
+--- File: ./internal/core/db_test.go ---
+package core
+
+import (
+	"os"
+	"testing"
+)
+
+func TestInitDB_PRAGMAs(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "test_finance_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	_ = tmpFile.Close()
+
+	db, err := InitDB(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	var journalMode string
+	if err := db.QueryRow("PRAGMA journal_mode;").Scan(&journalMode); err != nil {
+		t.Fatalf("query journal_mode failed: %v", err)
+	}
+	if journalMode != "wal" {
+		t.Errorf("expected journal_mode=wal, got %s", journalMode)
+	}
+
+	var foreignKeys int
+	if err := db.QueryRow("PRAGMA foreign_keys;").Scan(&foreignKeys); err != nil {
+		t.Fatalf("query foreign_keys failed: %v", err)
+	}
+	if foreignKeys != 1 {
+		t.Errorf("expected foreign_keys=1, got %d", foreignKeys)
+	}
+
+	var synchronous int
+	if err := db.QueryRow("PRAGMA synchronous;").Scan(&synchronous); err != nil {
+		t.Fatalf("query synchronous failed: %v", err)
+	}
+	if synchronous != 1 {
+		t.Errorf("expected synchronous=1 (NORMAL), got %d", synchronous)
+	}
+}
+
+
+--- File: ./internal/core/migrator_test.go ---
+package core
+
+import (
+	"embed"
+	"os"
+	"testing"
+)
+
+//go:embed testdata/migrations/*.sql
+var testMigrationsFS embed.FS
+
+func TestRunMigrations_IdempotencyAndDataIntegrity(t *testing.T) {
+	tmpFile, err := os.CreateTemp("", "test_migrator_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db file: %v", err)
+	}
+	defer func() { _ = os.Remove(tmpFile.Name()) }()
+	_ = tmpFile.Close()
+
+	db, err := InitDB(tmpFile.Name())
+	if err != nil {
+		t.Fatalf("InitDB failed: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if err := RunMigrations(db, testMigrationsFS, "testdata/migrations"); err != nil {
+		t.Fatalf("First RunMigrations run failed: %v", err)
+	}
+
+	if err := RunMigrations(db, testMigrationsFS, "testdata/migrations"); err != nil {
+		t.Fatalf("Second RunMigrations run (idempotency check) failed: %v", err)
+	}
+
+	var debtCount int
+	if err := db.QueryRow("SELECT COUNT(*) FROM debt_metadata;").Scan(&debtCount); err != nil {
+		t.Fatalf("query debt_metadata count failed: %v", err)
+	}
+	if debtCount != 0 {
+		t.Errorf("expected 0 debt entries in clean schema, got %d", debtCount)
+	}
+
+	_, err = db.Exec("INSERT INTO accounts (id, name, type, currency) VALUES ('acc-err', 'Fail Acc', 'DEBT', 'INVALID');")
+	if err == nil {
+		t.Errorf("expected foreign key constraint violation error, got nil")
+	}
+}
+
+
+--- File: ./internal/core/migrator.go ---
+package core
+
+import (
+	"database/sql"
+	"embed"
+	"fmt"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+)
+
+// RunMigrations виконує атомарні міграції з embedded FS у хронологічному порядку версій.
+func RunMigrations(db *sql.DB, migrationsFS embed.FS, dir string) error {
+	entries, err := migrationsFS.ReadDir(dir)
+	if err != nil {
+		return fmt.Errorf("failed to read embedded migrations dir: %w", err)
+	}
+
+	type migrationFile struct {
+		version int
+		name    string
+	}
+
+	var files []migrationFile
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".sql") {
+			continue
+		}
+		parts := strings.SplitN(entry.Name(), "_", 2)
+		if len(parts) < 2 {
+			continue
+		}
+		version, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		files = append(files, migrationFile{version: version, name: entry.Name()})
+	}
+
+	sort.Slice(files, func(i, j int) bool {
+		return files[i].version < files[j].version
+	})
+
+	_, err = db.Exec(`
+		CREATE TABLE IF NOT EXISTS schema_migrations (
+			version INTEGER PRIMARY KEY,
+			applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+		);
+	`)
+	if err != nil {
+		return fmt.Errorf("failed to create schema_migrations tracking table: %w", err)
+	}
+
+	for _, file := range files {
+		var exists bool
+		err := db.QueryRow("SELECT EXISTS(SELECT 1 FROM schema_migrations WHERE version = ?)", file.version).Scan(&exists)
+		if err != nil {
+			return fmt.Errorf("failed to verify migration version %d: %w", file.version, err)
+		}
+		if exists {
+			continue
+		}
+
+		content, err := migrationsFS.ReadFile(filepath.Join(dir, file.name))
+		if err != nil {
+			return fmt.Errorf("failed to read embedded migration file %s: %w", file.name, err)
+		}
+
+		tx, err := db.Begin()
+		if err != nil {
+			return fmt.Errorf("failed to begin transaction for migration %s: %w", file.name, err)
+		}
+
+		if _, err := tx.Exec(string(content)); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("failed execution of migration %s: %w", file.name, err)
+		}
+
+		if _, err := tx.Exec("INSERT INTO schema_migrations (version) VALUES (?)", file.version); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("failed to log migration version %d: %w", file.version, err)
+		}
+
+		if err := tx.Commit(); err != nil {
+			return fmt.Errorf("failed to commit transaction for migration %s: %w", file.name, err)
+		}
+	}
+
+	return nil
+}
+
+
+--- File: ./internal/config/config.go ---
+package config
+
+import (
+	"os"
+)
+
+type Config struct {
+	DBPath string
+}
+
+func Load() *Config {
+	dbPath := os.Getenv("DB_PATH")
+	if dbPath == "" {
+		dbPath = "./data/finance.db"
+	}
+	return &Config{DBPath: dbPath}
+}
+
+
+--- File: ./internal/domain/finance/testdata/migrations/000001_init_finance.sql ---
+-- Schema Versioning Tracking
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Currencies
+CREATE TABLE IF NOT EXISTS currencies (
+    code TEXT PRIMARY KEY,
+    symbol TEXT NOT NULL
+);
+
+-- Exchange Rates
+CREATE TABLE IF NOT EXISTS exchange_rates (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL, -- 'MONO', 'PUMB', 'MANUAL'
+    base_currency TEXT NOT NULL,
+    target_currency TEXT NOT NULL,
+    buy_rate REAL NOT NULL,
+    sell_rate REAL NOT NULL,
+    is_manual BOOLEAN NOT NULL DEFAULT 0,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (base_currency) REFERENCES currencies(code),
+    FOREIGN KEY (target_currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_exchange_rates_lookup 
+ON exchange_rates(source, base_currency, target_currency, is_manual, updated_at DESC);
+
+-- Accounts & Debt Categories
+CREATE TABLE IF NOT EXISTS accounts (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    type TEXT NOT NULL, -- 'INCOME_SOURCE', 'EXPENSE_CATEGORY', 'DEBT', 'ASSET'
+    currency TEXT NOT NULL,
+    initial_balance REAL DEFAULT 0.0,
+    current_balance REAL DEFAULT 0.0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+-- Debt Metadata (Cascade Payoff Attributes)
+CREATE TABLE IF NOT EXISTS debt_metadata (
+    account_id TEXT PRIMARY KEY,
+    priority INTEGER NOT NULL,
+    creditor_name TEXT NOT NULL,
+    original_currency TEXT NOT NULL,
+    original_amount REAL NOT NULL,
+    min_monthly_payment_uah REAL NOT NULL,
+    deadline_date TEXT,
+    status TEXT NOT NULL, -- 'OVERDUE', 'ACTIVE', 'PAID'
+    FOREIGN KEY (account_id) REFERENCES accounts(id) ON DELETE CASCADE,
+    FOREIGN KEY (original_currency) REFERENCES currencies(code)
+);
+
+-- Transactions
+CREATE TABLE IF NOT EXISTS transactions (
+    id TEXT PRIMARY KEY,
+    source_account_id TEXT,
+    destination_account_id TEXT,
+    amount REAL NOT NULL,
+    currency TEXT NOT NULL,
+    exchange_rate_applied REAL DEFAULT 1.0,
+    description TEXT,
+    execution_date TEXT NOT NULL, -- YYYY-MM-DD
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (source_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (destination_account_id) REFERENCES accounts(id),
+    FOREIGN KEY (currency) REFERENCES currencies(code)
+);
+
+CREATE INDEX IF NOT EXISTS idx_transactions_execution_date 
+ON transactions(execution_date DESC);
+
+
+--- File: ./internal/domain/finance/export_service_test.go ---
+package finance
+
+import (
+	"bytes"
+	"context"
+	"strings"
+	"testing"
+)
+
+func TestExportService_ExportDebtsToCSV(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_ = repo.AddCurrency(ctx, Currency{Code: "UAH", Symbol: "₴"})
+
+	acc := Account{
+		ID:             "d1",
+		Name:           "Moneyveo",
+		Type:           AccountTypeDebt,
+		Currency:       "UAH",
+		InitialBalance: -7721.92,
+		CurrentBalance: -7721.92,
+	}
+	_ = repo.CreateAccount(ctx, &acc)
+
+	debtMeta := DebtMetadata{
+		AccountID:            "d1",
+		Priority:             1,
+		CreditorName:         "Moneyveo",
+		OriginalCurrency:     "UAH",
+		OriginalAmount:       7721.92,
+		MinMonthlyPaymentUAH: 7721.92,
+		Status:               DebtStatusOverdue,
+	}
+	_ = repo.SetDebtMetadata(ctx, &debtMeta)
+
+	exportService := NewExportService(repo)
+	var buf bytes.Buffer
+
+	if err := exportService.ExportDebtsToCSV(ctx, &buf); err != nil {
+		t.Fatalf("ExportDebtsToCSV failed: %v", err)
+	}
+
+	csvOutput := buf.String()
+
+	if !strings.Contains(csvOutput, "Priority,Creditor,Status,Original_Currency") {
+		t.Errorf("expected CSV header, got:\n%s", csvOutput)
+	}
+
+	if !strings.Contains(csvOutput, "1,Moneyveo,OVERDUE,UAH,7721.92,-7721.92,7721.92") {
+		t.Errorf("expected row data for Moneyveo, got:\n%s", csvOutput)
+	}
+}
+
+
+--- File: ./internal/domain/finance/cashflow_engine.go ---
+package finance
+
+import (
+	"math"
+)
+
+type CashflowEngine struct{}
+
+func NewCashflowEngine() *CashflowEngine {
+	return &CashflowEngine{}
+}
+
+// ConvertToEUR конвертує суму в EUR за точним buyRate для UAH.
+func (e *CashflowEngine) ConvertToEUR(amount float64, currency string, buyRate float64) float64 {
+	if currency == "EUR" {
+		return amount
+	}
+	if currency == "UAH" && buyRate > 0 {
+		return amount / buyRate
+	}
+	return amount
+}
+
+// SimulateMonth виконує один крок помісячного каскадного погашення боргів.
+func (e *CashflowEngine) SimulateMonth(
+	monthName string,
+	incomes []IncomeItem,
+	expenses []ExpenseItem,
+	debts []DebtPayoffState,
+	buyRate float64,
+) (MonthlyProjection, []DebtPayoffState) {
+
+	projection := MonthlyProjection{
+		MonthName:        monthName,
+		EffectiveBuyRate: buyRate,
+	}
+
+	// 1. Обчислення загального доходу в EUR
+	for _, inc := range incomes {
+		projection.TotalIncomeEUR += e.ConvertToEUR(inc.Amount, inc.Currency, buyRate)
+	}
+
+	// 2. Обчислення фіксованих витрат в EUR
+	for _, exp := range expenses {
+		projection.TotalExpensesEUR += e.ConvertToEUR(exp.Amount, exp.Currency, buyRate)
+	}
+
+	availableCashEUR := projection.TotalIncomeEUR - projection.TotalExpensesEUR
+
+	// Копіюємо стан боргів для симуляції
+	currentDebts := make([]DebtPayoffState, len(debts))
+	copy(currentDebts, debts)
+
+	var totalDebtPaidEUR float64
+
+	// 3. Фаза A: Внесення мінімальних обов'язкових платежів
+	for i := range currentDebts {
+		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalance <= 0 {
+			continue
+		}
+
+		minPaymentEUR := e.ConvertToEUR(currentDebts[i].MinMonthlyPaymentUAH, "UAH", buyRate)
+		if currentDebts[i].OriginalCurrency == "EUR" {
+			minPaymentEUR = currentDebts[i].MinMonthlyPaymentUAH // якщо мінімальний платіж вказано безпосередньо в EUR
+		}
+
+		// Платіж не може перевищувати залишок боргу
+		actualPaymentEUR := math.Min(minPaymentEUR, e.ConvertToEUR(currentDebts[i].RemainingBalance, currentDebts[i].OriginalCurrency, buyRate))
+		actualPaymentEUR = math.Min(actualPaymentEUR, availableCashEUR)
+
+		if actualPaymentEUR > 0 {
+			paymentInOriginalCurrency := actualPaymentEUR
+			if currentDebts[i].OriginalCurrency == "UAH" {
+				paymentInOriginalCurrency = actualPaymentEUR * buyRate
+			}
+
+			currentDebts[i].RemainingBalance -= paymentInOriginalCurrency
+			availableCashEUR -= actualPaymentEUR
+			totalDebtPaidEUR += actualPaymentEUR
+
+			if currentDebts[i].RemainingBalance <= 0.01 {
+				currentDebts[i].RemainingBalance = 0
+				currentDebts[i].Status = DebtStatusPaid
+			}
+		}
+	}
+
+	// 4. Фаза B: Каскадне спрямування залишку вільного кешфлоу на найвищий пріоритет (P1 -> P4)
+	for i := range currentDebts {
+		if availableCashEUR <= 0 {
+			break
+		}
+		if currentDebts[i].Status == DebtStatusPaid || currentDebts[i].RemainingBalance <= 0 {
+			continue
+		}
+
+		remainingDebtEUR := e.ConvertToEUR(currentDebts[i].RemainingBalance, currentDebts[i].OriginalCurrency, buyRate)
+		extraPaymentEUR := math.Min(availableCashEUR, remainingDebtEUR)
+
+		extraPaymentInOriginalCurrency := extraPaymentEUR
+		if currentDebts[i].OriginalCurrency == "UAH" {
+			extraPaymentInOriginalCurrency = extraPaymentEUR * buyRate
+		}
+
+		currentDebts[i].RemainingBalance -= extraPaymentInOriginalCurrency
+		availableCashEUR -= extraPaymentEUR
+		totalDebtPaidEUR += extraPaymentEUR
+
+		if currentDebts[i].RemainingBalance <= 0.01 {
+			currentDebts[i].RemainingBalance = 0
+			currentDebts[i].Status = DebtStatusPaid
+		}
+	}
+
+	projection.DebtPaymentsEUR = totalDebtPaidEUR
+	projection.FreeCashflowEUR = availableCashEUR
+	projection.EndMonthDebtStates = currentDebts
+
+	return projection, currentDebts
+}
+
+
+--- File: ./internal/domain/finance/cashflow_engine_test.go ---
+package finance
+
+import (
+	"testing"
+)
+
+func TestCashflowEngine_SimulateCascadePayoff(t *testing.T) {
+	engine := NewCashflowEngine()
+
+	buyRate := 51.0700 // Monobank EUR/UAH
+
+	incomes := []IncomeItem{
+		{Name: "Salary September", Amount: 1230.00, Currency: "EUR"},
+	}
+
+	expenses := []ExpenseItem{
+		{Name: "Mobile", Amount: 12.20, Currency: "EUR"},
+		{Name: "TCL Pass", Amount: 20.50, Currency: "EUR"},
+	}
+
+	debts := []DebtPayoffState{
+		{AccountID: "d1", CreditorName: "Moneyveo", Priority: 1, OriginalCurrency: "UAH", RemainingBalance: 7721.92, MinMonthlyPaymentUAH: 7721.92, Status: DebtStatusOverdue},
+		{AccountID: "d2", CreditorName: "Monobank", Priority: 2, OriginalCurrency: "UAH", RemainingBalance: 20918.41, MinMonthlyPaymentUAH: 1950.96, Status: DebtStatusActive},
+		{AccountID: "d3", CreditorName: "BasicFit", Priority: 3, OriginalCurrency: "EUR", RemainingBalance: 74.97, MinMonthlyPaymentUAH: 74.97, Status: DebtStatusActive},
+	}
+
+	// Симуляція першого місяця
+	projection, updatedDebts := engine.SimulateMonth("2026-09", incomes, expenses, debts, buyRate)
+
+	// 1. Перевірка покриття P1 (Moneyveo) та P3 (BasicFit) повністю
+	if updatedDebts[0].Status != DebtStatusPaid || updatedDebts[0].RemainingBalance != 0 {
+		t.Errorf("expected P1 Moneyveo to be PAID, got balance %f status %s", updatedDebts[0].RemainingBalance, updatedDebts[0].Status)
+	}
+
+	if updatedDebts[2].Status != DebtStatusPaid || updatedDebts[2].RemainingBalance != 0 {
+		t.Errorf("expected P3 BasicFit to be PAID, got balance %f status %s", updatedDebts[2].RemainingBalance, updatedDebts[2].Status)
+	}
+
+	// 2. Перевірка часткового погашення P2 (Monobank)
+	if updatedDebts[1].RemainingBalance >= 20918.41 {
+		t.Errorf("expected P2 Monobank balance to decrease, got %f", updatedDebts[1].RemainingBalance)
+	}
+
+	// 3. Перевірка позитивного чистого залишку вільного кешу
+	if projection.FreeCashflowEUR <= 0 {
+		t.Errorf("expected positive free cashflow, got %f", projection.FreeCashflowEUR)
+	}
+}
+
+
+--- File: ./internal/domain/finance/rate_service_test.go ---
+package finance
+
+import (
+	"context"
+	"net/http"
+	"net/http/httptest"
+	"testing"
+)
+
+func TestRateService_SyncAndResolutionPriority(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	_ = repo.AddCurrency(ctx, Currency{Code: "EUR", Symbol: "€"})
+	_ = repo.AddCurrency(ctx, Currency{Code: "UAH", Symbol: "₴"})
+
+	// Mock Monobank Server
+	mockServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`[
+			{"currencyCodeA": 978, "currencyCodeB": 980, "date": 1700000000, "rateBuy": 51.0700, "rateSell": 51.7706}
+		]`))
+	}))
+	defer mockServer.Close()
+
+	service := NewRateService(repo, mockServer.Client())
+	service.monoAPIURL = mockServer.URL
+
+	// 1. Синхронізація з Monobank API
+	if err := service.SyncMonobankRates(ctx); err != nil {
+		t.Fatalf("SyncMonobankRates failed: %v", err)
+	}
+
+	effectiveRate, err := service.GetEffectiveRate(ctx, "EUR", "UAH")
+	if err != nil {
+		t.Fatalf("GetEffectiveRate failed: %v", err)
+	}
+	if effectiveRate.Source != SourceMonobank || effectiveRate.BuyRate != 51.0700 {
+		t.Errorf("expected Monobank rate 51.0700, got source %s with rate %f", effectiveRate.Source, effectiveRate.BuyRate)
+	}
+
+	// 2. Встановлення Manual Override
+	if err := service.SetManualRate(ctx, "EUR", "UAH", 52.0000, 52.5000); err != nil {
+		t.Fatalf("SetManualRate failed: %v", err)
+	}
+
+	effectiveRate, err = service.GetEffectiveRate(ctx, "EUR", "UAH")
+	if err != nil {
+		t.Fatalf("GetEffectiveRate failed after manual override: %v", err)
+	}
+	if !effectiveRate.IsManual || effectiveRate.BuyRate != 52.0000 {
+		t.Errorf("expected Manual rate 52.0000 with IsManual=true, got source %s rate %f", effectiveRate.Source, effectiveRate.BuyRate)
+	}
+}
+
+
+--- File: ./internal/domain/finance/export_service.go ---
+package finance
+
+import (
+	"context"
+	"encoding/csv"
+	"fmt"
+	"io"
+)
+
+type ExportService struct {
+	repo Repository
+}
+
+func NewExportService(repo Repository) *ExportService {
+	return &ExportService{repo: repo}
+}
+
+// ExportDebtsToCSV генерує CSV-файл із поточним станом боргів та їх пріоритетами.
+func (s *ExportService) ExportDebtsToCSV(ctx context.Context, w io.Writer) error {
+	writer := csv.NewWriter(w)
+	defer writer.Flush()
+
+	// RFC 4180 Header
+	header := []string{
+		"Priority",
+		"Creditor",
+		"Status",
+		"Original_Currency",
+		"Original_Amount",
+		"Current_Balance",
+		"Min_Monthly_Payment_UAH",
+		"Deadline",
+	}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("failed to write csv header: %w", err)
+	}
+
+	debts, err := s.repo.GetActiveDebtsOrderedByPriority(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to get active debts for export: %w", err)
+	}
+
+	for _, d := range debts {
+		acc, err := s.repo.GetAccountByID(ctx, d.AccountID)
+		currentBalance := 0.0
+		if err == nil && acc != nil {
+			currentBalance = acc.CurrentBalance
+		}
+
+		deadline := ""
+		if d.DeadlineDate != nil {
+			deadline = *d.DeadlineDate
+		}
+
+		record := []string{
+			fmt.Sprintf("%d", d.Priority),
+			d.CreditorName,
+			string(d.Status),
+			d.OriginalCurrency,
+			fmt.Sprintf("%.2f", d.OriginalAmount),
+			fmt.Sprintf("%.2f", currentBalance),
+			fmt.Sprintf("%.2f", d.MinMonthlyPaymentUAH),
+			deadline,
+		}
+
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write csv row: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// ExportTransactionsToCSV генерує CSV-файл списку фінансових транзакцій.
+func (s *ExportService) ExportTransactionsToCSV(ctx context.Context, w io.Writer, limit int) error {
+	writer := csv.NewWriter(w)
+	defer writer.Flush()
+
+	header := []string{
+		"ID",
+		"Execution_Date",
+		"Source_Account",
+		"Destination_Account",
+		"Amount",
+		"Currency",
+		"Exchange_Rate_Applied",
+		"Description",
+	}
+	if err := writer.Write(header); err != nil {
+		return fmt.Errorf("failed to write csv header: %w", err)
+	}
+
+	transactions, err := s.repo.GetTransactions(ctx, limit)
+	if err != nil {
+		return fmt.Errorf("failed to query transactions for export: %w", err)
+	}
+
+	for _, tx := range transactions {
+		sourceAcc := ""
+		if tx.SourceAccountID != nil {
+			sourceAcc = *tx.SourceAccountID
+		}
+		destAcc := ""
+		if tx.DestinationAccountID != nil {
+			destAcc = *tx.DestinationAccountID
+		}
+
+		record := []string{
+			tx.ID,
+			tx.ExecutionDate,
+			sourceAcc,
+			destAcc,
+			fmt.Sprintf("%.2f", tx.Amount),
+			tx.Currency,
+			fmt.Sprintf("%.4f", tx.ExchangeRateApplied),
+			tx.Description,
+		}
+
+		if err := writer.Write(record); err != nil {
+			return fmt.Errorf("failed to write transaction csv row: %w", err)
+		}
+	}
+
+	return nil
+}
+
+
+--- File: ./internal/domain/finance/rate_service.go ---
+package finance
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net/http"
+	"time"
+)
+
+const (
+	ISOEUR = 978
+	ISOUAH = 980
+
+	SourceMonobank = "MONO"
+	SourcePUMB     = "PUMB"
+	SourceManual   = "MANUAL"
+)
+
+type MonobankRateResponse struct {
+	CurrencyCodeA int     `json:"currencyCodeA"`
+	CurrencyCodeB int     `json:"currencyCodeB"`
+	Date          int64   `json:"date"`
+	RateBuy       float64 `json:"rateBuy"`
+	RateSell      float64 `json:"rateSell"`
+	RateCross     float64 `json:"rateCross"`
+}
+
+type RateService struct {
+	repo       Repository
+	httpClient *http.Client
+	monoAPIURL string
+}
+
+func NewRateService(repo Repository, httpClient *http.Client) *RateService {
+	if httpClient == nil {
+		httpClient = &http.Client{Timeout: 10 * time.Second}
+	}
+	return &RateService{
+		repo:       repo,
+		httpClient: httpClient,
+		monoAPIURL: "https://api.monobank.ua/bank/currency",
+	}
+}
+
+func (s *RateService) SyncMonobankRates(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.monoAPIURL, http.NoBody)
+	if err != nil {
+		return fmt.Errorf("failed to create monobank request: %w", err)
+	}
+
+	resp, err := s.httpClient.Do(req)
+	if err != nil {
+		return fmt.Errorf("monobank api request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("monobank api returned status: %d", resp.StatusCode)
+	}
+
+	var rates []MonobankRateResponse
+	if err := json.NewDecoder(resp.Body).Decode(&rates); err != nil {
+		return fmt.Errorf("failed to decode monobank response: %w", err)
+	}
+
+	for _, r := range rates {
+		if r.CurrencyCodeA == ISOEUR && r.CurrencyCodeB == ISOUAH {
+			rate := ExchangeRate{
+				Source:         SourceMonobank,
+				BaseCurrency:   "EUR",
+				TargetCurrency: "UAH",
+				BuyRate:        r.RateBuy,
+				SellRate:       r.RateSell,
+				IsManual:       false,
+			}
+			return s.repo.SaveExchangeRate(ctx, &rate)
+		}
+	}
+
+	return fmt.Errorf("EUR/UAH rate pair not found in monobank response")
+}
+
+func (s *RateService) SetManualRate(ctx context.Context, base, target string, buy, sell float64) error {
+	rate := ExchangeRate{
+		Source:         SourceManual,
+		BaseCurrency:   base,
+		TargetCurrency: target,
+		BuyRate:        buy,
+		SellRate:       sell,
+		IsManual:       true,
+	}
+	return s.repo.SaveExchangeRate(ctx, &rate)
+}
+
+func (s *RateService) GetEffectiveRate(ctx context.Context, base, target string) (*ExchangeRate, error) {
+	rates, err := s.repo.GetLatestRates(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest rates: %w", err)
+	}
+
+	var bestMatch *ExchangeRate
+	for i := range rates {
+		r := rates[i]
+		if r.BaseCurrency == base && r.TargetCurrency == target {
+			if r.IsManual {
+				return &r, nil
+			}
+			if bestMatch == nil {
+				bestMatch = &r
+			}
+		}
+	}
+
+	if bestMatch != nil {
+		return bestMatch, nil
+	}
+
+	return nil, fmt.Errorf("no exchange rate found for pair %s/%s", base, target)
+}
+
+
+--- File: ./internal/domain/finance/model.go ---
+package finance
+
+import "time"
+
+type AccountType string
+
+const (
+	AccountTypeIncomeSource    AccountType = "INCOME_SOURCE"
+	AccountTypeExpenseCategory AccountType = "EXPENSE_CATEGORY"
+	AccountTypeDebt            AccountType = "DEBT"
+	AccountTypeAsset           AccountType = "ASSET"
+)
+
+type DebtStatus string
+
+const (
+	DebtStatusOverdue DebtStatus = "OVERDUE"
+	DebtStatusActive  DebtStatus = "ACTIVE"
+	DebtStatusPaid    DebtStatus = "PAID"
+)
+
+type Currency struct {
+	Code   string `json:"code"`
+	Symbol string `json:"symbol"`
+}
+
+type ExchangeRate struct {
+	ID             int64     `json:"id"`
+	Source         string    `json:"source"` // 'MONO', 'PUMB', 'MANUAL'
+	BaseCurrency   string    `json:"base_currency"`
+	TargetCurrency string    `json:"target_currency"`
+	BuyRate        float64   `json:"buy_rate"`
+	SellRate       float64   `json:"sell_rate"`
+	IsManual       bool      `json:"is_manual"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
+type Account struct {
+	ID             string      `json:"id"`
+	Name           string      `json:"name"`
+	Type           AccountType `json:"type"`
+	Currency       string      `json:"currency"`
+	InitialBalance float64     `json:"initial_balance"`
+	CurrentBalance float64     `json:"current_balance"`
+	CreatedAt      time.Time   `json:"created_at"`
+}
+
+type DebtMetadata struct {
+	AccountID            string     `json:"account_id"`
+	Priority             int        `json:"priority"`
+	CreditorName         string     `json:"creditor_name"`
+	OriginalCurrency     string     `json:"original_currency"`
+	OriginalAmount       float64    `json:"original_amount"`
+	MinMonthlyPaymentUAH float64    `json:"min_monthly_payment_uah"`
+	DeadlineDate         *string    `json:"deadline_date,omitempty"` // YYYY-MM-DD
+	Status               DebtStatus `json:"status"`
+}
+
+type Transaction struct {
+	ID                   string    `json:"id"`
+	SourceAccountID      *string   `json:"source_account_id,omitempty"`
+	DestinationAccountID *string   `json:"destination_account_id,omitempty"`
+	Amount               float64   `json:"amount"`
+	Currency             string    `json:"currency"`
+	ExchangeRateApplied  float64   `json:"exchange_rate_applied"`
+	Description          string    `json:"description"`
+	ExecutionDate        string    `json:"execution_date"` // YYYY-MM-DD
+	CreatedAt            time.Time `json:"created_at"`
+}
+
+
+--- File: ./internal/domain/finance/repository_sqlite_test.go ---
+package finance
+
+import (
+	"context"
+	"embed"
+	"os"
+	"testing"
+
+	"plos/internal/core"
+)
+
+//go:embed testdata/migrations/*.sql
+var testMigrationsFS embed.FS
+
+func setupTestDB(t *testing.T) (repo *SQLiteRepository, cleanup func()) {
+	t.Helper()
+
+	tmpFile, err := os.CreateTemp("", "test_repo_*.db")
+	if err != nil {
+		t.Fatalf("failed to create temp db: %v", err)
+	}
+	_ = tmpFile.Close()
+
+	db, err := core.InitDB(tmpFile.Name())
+	if err != nil {
+		_ = os.Remove(tmpFile.Name())
+		t.Fatalf("InitDB failed: %v", err)
+	}
+
+	if err := core.RunMigrations(db, testMigrationsFS, "testdata/migrations"); err != nil {
+		_ = db.Close()
+		_ = os.Remove(tmpFile.Name())
+		t.Fatalf("RunMigrations failed: %v", err)
+	}
+
+	repo = NewSQLiteRepository(db)
+	cleanup = func() {
+		_ = db.Close()
+		_ = os.Remove(tmpFile.Name())
+	}
+
+	return repo, cleanup
+}
+
+func TestSQLiteRepository_CurrenciesAndAccounts(t *testing.T) {
+	repo, cleanup := setupTestDB(t)
+	defer cleanup()
+
+	ctx := context.Background()
+
+	if err := repo.AddCurrency(ctx, Currency{Code: "EUR", Symbol: "€"}); err != nil {
+		t.Fatalf("AddCurrency EUR failed: %v", err)
+	}
+	if err := repo.AddCurrency(ctx, Currency{Code: "UAH", Symbol: "₴"}); err != nil {
+		t.Fatalf("AddCurrency UAH failed: %v", err)
+	}
+
+	currencies, err := repo.GetCurrencies(ctx)
+	if err != nil {
+		t.Fatalf("GetCurrencies failed: %v", err)
+	}
+	if len(currencies) != 2 {
+		t.Fatalf("expected 2 currencies, got %d", len(currencies))
+	}
+
+	acc := Account{
+		ID:             "acc-mfo-1",
+		Name:           "Moneyveo",
+		Type:           AccountTypeDebt,
+		Currency:       "UAH",
+		InitialBalance: -7721.92,
+		CurrentBalance: -7721.92,
+	}
+	if err := repo.CreateAccount(ctx, &acc); err != nil {
+		t.Fatalf("CreateAccount failed: %v", err)
+	}
+
+	debtMeta := DebtMetadata{
+		AccountID:            acc.ID,
+		Priority:             1,
+		CreditorName:         "Moneyveo",
+		OriginalCurrency:     "UAH",
+		OriginalAmount:       7721.92,
+		MinMonthlyPaymentUAH: 7721.92,
+		Status:               DebtStatusOverdue,
+	}
+	if err := repo.SetDebtMetadata(ctx, &debtMeta); err != nil {
+		t.Fatalf("SetDebtMetadata failed: %v", err)
+	}
+
+	debts, err := repo.GetActiveDebtsOrderedByPriority(ctx)
+	if err != nil {
+		t.Fatalf("GetActiveDebtsOrderedByPriority failed: %v", err)
+	}
+	if len(debts) != 1 {
+		t.Fatalf("expected 1 active debt, got %d", len(debts))
+	}
+	if debts[0].Priority != 1 || debts[0].CreditorName != "Moneyveo" {
+		t.Errorf("unexpected debt metadata content: %+v", debts[0])
+	}
+}
+
+
+--- File: ./internal/domain/finance/cashflow_models.go ---
+package finance
+
+type IncomeItem struct {
+	Name     string  `json:"name"`
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}
+
+type ExpenseItem struct {
+	Name     string  `json:"name"`
+	Amount   float64 `json:"amount"`
+	Currency string  `json:"currency"`
+}
+
+type DebtPayoffState struct {
+	AccountID            string     `json:"account_id"`
+	CreditorName         string     `json:"creditor_name"`
+	Priority             int        `json:"priority"`
+	OriginalCurrency     string     `json:"original_currency"`
+	RemainingBalance     float64    `json:"remaining_balance"`
+	MinMonthlyPaymentUAH float64    `json:"min_monthly_payment_uah"`
+	Status               DebtStatus `json:"status"`
+}
+
+type MonthlyProjection struct {
+	MonthName          string            `json:"month_name"` // Example: "2026-09"
+	TotalIncomeEUR     float64           `json:"total_income_eur"`
+	TotalExpensesEUR   float64           `json:"total_expenses_eur"`
+	DebtPaymentsEUR    float64           `json:"debt_payments_eur"`
+	FreeCashflowEUR    float64           `json:"free_cashflow_eur"`
+	EffectiveBuyRate   float64           `json:"effective_buy_rate"`
+	EndMonthDebtStates []DebtPayoffState `json:"end_month_debt_states"`
+}
+
+
+--- File: ./internal/domain/finance/repository_sqlite.go ---
+package finance
+
+import (
+	"context"
+	"database/sql"
+	"fmt"
+)
+
+type SQLiteRepository struct {
+	db *sql.DB
+}
+
+func NewSQLiteRepository(db *sql.DB) *SQLiteRepository {
+	return &SQLiteRepository{db: db}
+}
+
+func (r *SQLiteRepository) AddCurrency(ctx context.Context, currency Currency) error {
+	query := `INSERT INTO currencies (code, symbol) VALUES (?, ?) ON CONFLICT(code) DO UPDATE SET symbol=excluded.symbol`
+	_, err := r.db.ExecContext(ctx, query, currency.Code, currency.Symbol)
+	if err != nil {
+		return fmt.Errorf("failed to add currency: %w", err)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetCurrencies(ctx context.Context) ([]Currency, error) {
+	rows, err := r.db.QueryContext(ctx, `SELECT code, symbol FROM currencies ORDER BY code ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query currencies: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var list []Currency
+	for rows.Next() {
+		var c Currency
+		if err := rows.Scan(&c.Code, &c.Symbol); err != nil {
+			return nil, err
+		}
+		list = append(list, c)
+	}
+	return list, rows.Err()
+}
+
+func (r *SQLiteRepository) SaveExchangeRate(ctx context.Context, rate *ExchangeRate) error {
+	query := `
+		INSERT INTO exchange_rates (source, base_currency, target_currency, buy_rate, sell_rate, is_manual, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)
+	`
+	_, err := r.db.ExecContext(ctx, query, rate.Source, rate.BaseCurrency, rate.TargetCurrency, rate.BuyRate, rate.SellRate, rate.IsManual)
+	if err != nil {
+		return fmt.Errorf("failed to save exchange rate: %w", err)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetLatestRates(ctx context.Context) ([]ExchangeRate, error) {
+	query := `
+		SELECT id, source, base_currency, target_currency, buy_rate, sell_rate, is_manual, updated_at
+		FROM exchange_rates
+		WHERE id IN (
+			SELECT MAX(id) FROM exchange_rates GROUP BY source, base_currency, target_currency
+		)
+		ORDER BY updated_at DESC
+	`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest rates: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var rates []ExchangeRate
+	for rows.Next() {
+		var rate ExchangeRate
+		if err := rows.Scan(&rate.ID, &rate.Source, &rate.BaseCurrency, &rate.TargetCurrency, &rate.BuyRate, &rate.SellRate, &rate.IsManual, &rate.UpdatedAt); err != nil {
+			return nil, err
+		}
+		rates = append(rates, rate)
+	}
+	return rates, rows.Err()
+}
+
+func (r *SQLiteRepository) CreateAccount(ctx context.Context, acc *Account) error {
+	query := `
+		INSERT INTO accounts (id, name, type, currency, initial_balance, current_balance)
+		VALUES (?, ?, ?, ?, ?, ?)
+	`
+	_, err := r.db.ExecContext(ctx, query, acc.ID, acc.Name, string(acc.Type), acc.Currency, acc.InitialBalance, acc.CurrentBalance)
+	if err != nil {
+		return fmt.Errorf("failed to create account: %w", err)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetAccountByID(ctx context.Context, id string) (*Account, error) {
+	query := `SELECT id, name, type, currency, initial_balance, current_balance, created_at FROM accounts WHERE id = ?`
+	row := r.db.QueryRowContext(ctx, query, id)
+
+	var acc Account
+	var accType string
+	if err := row.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalance, &acc.CurrentBalance, &acc.CreatedAt); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to scan account: %w", err)
+	}
+	acc.Type = AccountType(accType)
+	return &acc, nil
+}
+
+func (r *SQLiteRepository) GetAccounts(ctx context.Context) ([]Account, error) {
+	query := `SELECT id, name, type, currency, initial_balance, current_balance, created_at FROM accounts ORDER BY name ASC`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query accounts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var accounts []Account
+	for rows.Next() {
+		var acc Account
+		var accType string
+		if err := rows.Scan(&acc.ID, &acc.Name, &accType, &acc.Currency, &acc.InitialBalance, &acc.CurrentBalance, &acc.CreatedAt); err != nil {
+			return nil, err
+		}
+		acc.Type = AccountType(accType)
+		accounts = append(accounts, acc)
+	}
+	return accounts, rows.Err()
+}
+
+func (r *SQLiteRepository) SetDebtMetadata(ctx context.Context, meta *DebtMetadata) error {
+	query := `
+		INSERT INTO debt_metadata (account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(account_id) DO UPDATE SET
+			priority=excluded.priority,
+			creditor_name=excluded.creditor_name,
+			original_currency=excluded.original_currency,
+			original_amount=excluded.original_amount,
+			min_monthly_payment_uah=excluded.min_monthly_payment_uah,
+			deadline_date=excluded.deadline_date,
+			status=excluded.status
+	`
+	_, err := r.db.ExecContext(ctx, query,
+		meta.AccountID, meta.Priority, meta.CreditorName, meta.OriginalCurrency,
+		meta.OriginalAmount, meta.MinMonthlyPaymentUAH, meta.DeadlineDate, string(meta.Status),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to set debt metadata: %w", err)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetDebtMetadata(ctx context.Context, accountID string) (*DebtMetadata, error) {
+	query := `SELECT account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status FROM debt_metadata WHERE account_id = ?`
+	row := r.db.QueryRowContext(ctx, query, accountID)
+
+	var meta DebtMetadata
+	var status string
+	if err := row.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmount, &meta.MinMonthlyPaymentUAH, &meta.DeadlineDate, &status); err != nil {
+		if err == sql.ErrNoRows {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("failed to scan debt metadata: %w", err)
+	}
+	meta.Status = DebtStatus(status)
+	return &meta, nil
+}
+
+func (r *SQLiteRepository) GetActiveDebtsOrderedByPriority(ctx context.Context) ([]DebtMetadata, error) {
+	query := `
+		SELECT account_id, priority, creditor_name, original_currency, original_amount, min_monthly_payment_uah, deadline_date, status
+		FROM debt_metadata
+		WHERE status != 'PAID'
+		ORDER BY priority ASC
+	`
+	rows, err := r.db.QueryContext(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query active debts: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var list []DebtMetadata
+	for rows.Next() {
+		var meta DebtMetadata
+		var status string
+		if err := rows.Scan(&meta.AccountID, &meta.Priority, &meta.CreditorName, &meta.OriginalCurrency, &meta.OriginalAmount, &meta.MinMonthlyPaymentUAH, &meta.DeadlineDate, &status); err != nil {
+			return nil, err
+		}
+		meta.Status = DebtStatus(status)
+		list = append(list, meta)
+	}
+	return list, rows.Err()
+}
+
+func (r *SQLiteRepository) CreateTransaction(ctx context.Context, tx *Transaction) error {
+	query := `
+		INSERT INTO transactions (id, source_account_id, destination_account_id, amount, currency, exchange_rate_applied, description, execution_date)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	`
+	_, err := r.db.ExecContext(ctx, query, tx.ID, tx.SourceAccountID, tx.DestinationAccountID, tx.Amount, tx.Currency, tx.ExchangeRateApplied, tx.Description, tx.ExecutionDate)
+	if err != nil {
+		return fmt.Errorf("failed to create transaction: %w", err)
+	}
+	return nil
+}
+
+func (r *SQLiteRepository) GetTransactions(ctx context.Context, limit int) ([]Transaction, error) {
+	query := `
+		SELECT id, source_account_id, destination_account_id, amount, currency, exchange_rate_applied, description, execution_date, created_at
+		FROM transactions
+		ORDER BY execution_date DESC, created_at DESC
+		LIMIT ?
+	`
+	rows, err := r.db.QueryContext(ctx, query, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query transactions: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var list []Transaction
+	for rows.Next() {
+		var tx Transaction
+		if err := rows.Scan(&tx.ID, &tx.SourceAccountID, &tx.DestinationAccountID, &tx.Amount, &tx.Currency, &tx.ExchangeRateApplied, &tx.Description, &tx.ExecutionDate, &tx.CreatedAt); err != nil {
+			return nil, err
+		}
+		list = append(list, tx)
+	}
+	return list, rows.Err()
+}
+
+
+--- File: ./internal/domain/finance/repository.go ---
+package finance
+
+import "context"
+
+type Repository interface {
+	// Currencies & Rates
+	AddCurrency(ctx context.Context, currency Currency) error
+	GetCurrencies(ctx context.Context) ([]Currency, error)
+	SaveExchangeRate(ctx context.Context, rate *ExchangeRate) error
+	GetLatestRates(ctx context.Context) ([]ExchangeRate, error)
+
+	// Accounts & Debts
+	CreateAccount(ctx context.Context, acc *Account) error
+	GetAccountByID(ctx context.Context, id string) (*Account, error)
+	GetAccounts(ctx context.Context) ([]Account, error)
+	SetDebtMetadata(ctx context.Context, meta *DebtMetadata) error
+	GetDebtMetadata(ctx context.Context, accountID string) (*DebtMetadata, error)
+	GetActiveDebtsOrderedByPriority(ctx context.Context) ([]DebtMetadata, error)
+
+	// Transactions
+	CreateTransaction(ctx context.Context, tx *Transaction) error
+	GetTransactions(ctx context.Context, limit int) ([]Transaction, error)
+}
+
+
+--- File: ./go.sum ---
+github.com/dustin/go-humanize v1.0.1 h1:GzkhY7T5VNhEkwH0PVJgjz+fX1rhBrR7pRT3mDkpeCY=
+github.com/dustin/go-humanize v1.0.1/go.mod h1:Mu1zIs6XwVuF/gI1OepvI0qD18qycQx+mFykh5fBlto=
+github.com/go-chi/chi/v5 v5.3.2 h1:5YQkICvTCSZ25hoRsyJazN0scjzKGiu4VAUc7H1o1nY=
+github.com/go-chi/chi/v5 v5.3.2/go.mod h1:R+tYY2hNuVUUjxoPtqUdgBqevM9s9njzkTLutVsOCto=
+github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3 h1:LMLX+LgTNWpfvCBdFebv6EsYotImrt/Ppc5cXIriCSo=
+github.com/google/pprof v0.0.0-20260802141513-ef3492d7dac3/go.mod h1:jl5iWTm0/hd5PjEYEOuwAJ57L/CibdZfrqZ5XA5GrCk=
+github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
+github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
+github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs4luLUK2k=
+github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
+github.com/mattn/go-isatty v0.0.24 h1:tGZZoVgT/KiqK1c8ocVLeDS8BSWMRd47J3Lbz7vsReI=
+github.com/mattn/go-isatty v0.0.24/go.mod h1:nMCL3Zebbrt45jsMDgnfIwz6ydEQApk5oEI3HqDio6A=
+github.com/ncruces/go-strftime v1.0.0 h1:HMFp8mLCTPp341M/ZnA4qaf7ZlsbTc+miZjCLOFAw7w=
+github.com/ncruces/go-strftime v1.0.0/go.mod h1:Fwc5htZGVVkseilnfgOVb9mKy6w1naJmn9CehxcKcls=
+github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec h1:W09IVJc94icq4NjY3clb7Lk8O1qJ8BdBEF8z0ibU0rE=
+github.com/remyoudompheng/bigfft v0.0.0-20230129092748-24d4a6f8daec/go.mod h1:qqbHyh8v60DhA7CoWK5oRCqLrMHRGoxYCSS9EjAz6Eo=
+golang.org/x/mod v0.38.0 h1:MECBjubtXD7yj4HrhIUcywNaGeNVUdfVnxmPajOk4yk=
+golang.org/x/mod v0.38.0/go.mod h1:V6Xz0pq8TQ3dGqVQ1FVHuelZpAL0uNhSkk9ogYP3c40=
+golang.org/x/sync v0.22.0 h1:SZjpbeLmrCk4xhRSZFNZW5gFUeCeFgjekvI/+gfScek=
+golang.org/x/sync v0.22.0/go.mod h1:9xrNwdLfx4jkKbNva9FpL6vEN7evnE43NNNJQ2LF3+0=
+golang.org/x/sys v0.47.0 h1:o7XGOvZQCADBQQ4Y7VNq2dRWQR7JmOUW8Kxx4ZsNgWs=
+golang.org/x/sys v0.47.0/go.mod h1:4GL1E5IUh+htKOUEOaiffhrAeqysfVGipDYzABqnCmw=
+golang.org/x/tools v0.48.0 h1:3+hClM1aLL5mjMKm5ovokw9epgRXPuu2tILgismM6RE=
+golang.org/x/tools v0.48.0/go.mod h1:08xX0orndb/F7jJxGDicx061tyd5pcMto75YMAXr6lk=
+modernc.org/cc/v4 v4.29.2 h1:h6+9ciCnPKutf4I03CvheAvDLX7+IHlqR6Iy6J+cgd8=
+modernc.org/cc/v4 v4.29.2/go.mod h1:OnovgIhbbMXMu1aISnJ0wvVD1KnW+cAUJkIrAWh+kVI=
+modernc.org/ccgo/v4 v4.35.0 h1:F+TUsmw09QxLzmi3aeYYGxjAXarmZaKgj3mKQHNaA8w=
+modernc.org/ccgo/v4 v4.35.0/go.mod h1:qrVGs9S3Sr2Ztcg9ve+kTAYMp5a3YvWjo+SoN06kJ5I=
+modernc.org/fileutil v1.4.0 h1:j6ZzNTftVS054gi281TyLjHPp6CPHr2KCxEXjEbD6SM=
+modernc.org/fileutil v1.4.0/go.mod h1:EqdKFDxiByqxLk8ozOxObDSfcVOv/54xDs/DUHdvCUU=
+modernc.org/gc/v2 v2.6.5 h1:nyqdV8q46KvTpZlsw66kWqwXRHdjIlJOhG6kxiV/9xI=
+modernc.org/gc/v2 v2.6.5/go.mod h1:YgIahr1ypgfe7chRuJi2gD7DBQiKSLMPgBQe9oIiito=
+modernc.org/gc/v3 v3.1.5 h1:21ldfPfRYE31Tb7B3mwAK8gy1AxP4+dKjrOQPfqakoc=
+modernc.org/gc/v3 v3.1.5/go.mod h1:HFK/6AGESC7Ex+EZJhJ2Gni6cTaYpSMmU/cT9RmlfYY=
+modernc.org/goabi0 v0.2.0 h1:HvEowk7LxcPd0eq6mVOAEMai46V+i7Jrj13t4AzuNks=
+modernc.org/goabi0 v0.2.0/go.mod h1:CEFRnnJhKvWT1c1JTI3Avm+tgOWbkOu5oPA8eH8LnMI=
+modernc.org/libc v1.75.7 h1:o3DTP9/0p9pKmY2WCKQaySW6wIiZhNM7wc2lUoyhfew=
+modernc.org/libc v1.75.7/go.mod h1:bO5o2ztHxBb2rjz0PgdHN0sSMw57CgxGFLZ3Qd/QpVQ=
+modernc.org/mathutil v1.7.1 h1:GCZVGXdaN8gTqB1Mf/usp1Y/hSqgI2vAGGP4jZMCxOU=
+modernc.org/mathutil v1.7.1/go.mod h1:4p5IwJITfppl0G4sUEDtCr4DthTaT47/N3aT6MhfgJg=
+modernc.org/memory v1.12.1 h1:nFMiWrpStgZczNl6XI9GnIk/rWhYIyHGUaR04pGbp9g=
+modernc.org/memory v1.12.1/go.mod h1:/JP4VbVC+K5sU2wZi9bHoq2MAkCnrt2r98UGeSK7Mjw=
+modernc.org/opt v0.2.0 h1:tGyef5ApycA7FSEOMraay9SaTk5zmbx7Tu+cJs4QKZg=
+modernc.org/opt v0.2.0/go.mod h1:03fq9lsNfvkYSfxrfUhZCWPk1lm4cq4N+Bh//bEtgns=
+modernc.org/sortutil v1.2.1 h1:+xyoGf15mM3NMlPDnFqrteY07klSFxLElE2PVuWIJ7w=
+modernc.org/sortutil v1.2.1/go.mod h1:7ZI3a3REbai7gzCLcotuw9AC4VZVpYMjDzETGsSMqJE=
+modernc.org/sqlite v1.59.0 h1:X1es1GpqBlS/5T+vbM4HLUdaa8OtQx468DF2vrx+38A=
+modernc.org/sqlite v1.59.0/go.mod h1:+paeT2A3iPRHkQDwG7oA6Tk0zQd5woMEI8q7orfry8k=
+modernc.org/strutil v1.2.1 h1:UneZBkQA+DX2Rp35KcM69cSsNES9ly8mQWD71HKlOA0=
+modernc.org/strutil v1.2.1/go.mod h1:EHkiggD70koQxjVdSBM3JKM7k6L0FbGE5eymy9i3B9A=
+modernc.org/token v1.1.0 h1:Xl7Ap9dKaEs5kLoOQeQmPWevfnk/DM5qcLcYlA8ys6Y=
+modernc.org/token v1.1.0/go.mod h1:UGzOrNV1mAFSEB63lOFHIpNRUVMvYTc6yu1SMY/XTDM=
+
+
+--- File: ./.golangci.yml ---
+run:
+  timeout: 5m
+  modules-download-mode: readonly
+
+linters:
+  enable:
+    - gofmt
+    - goimports
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - gocritic
+    - bodyclose
+    - nilerr
+    - sqlclosecheck
+
+linters-settings:
+  gofmt:
+    simplify: true
+  goimports:
+    local-prefixes: plos
+  gocritic:
+    enabled-tags:
+      - diagnostic
+      - performance
+      - style
+
+issues:
+  exclude-use-default: false
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+
+--- File: ./README.md ---
+# PLOS (Personal Local Operating System)
+
+
+--- File: ./.gitignore ---
+# Local SQLite Storage & WAL files
+/data/*
+!/data/.gitkeep
+*.db
+*.db-shm
+*.db-wal
+
+# Go Binaries & Cache
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Node.js / Frontend
+/web/node_modules/
+/web/dist/*
+!/web/dist/index.html
+/web/.svelte-kit/
+/web/.vite/
+.npm
+*.log
+
+# Environment & Local Secrets
+.env
+.env.local
+*.pem
+
+# IDEs & System files
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+
+--- File: ./.github/workflows/ci.yml ---
+name: Backend CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  lint:
+    name: Linting
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: golangci-lint
+        uses: golangci-lint/golangci-lint-action@v6
+        with:
+          version: v1.60.3
+
+  test:
+    name: Test & Build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+          cache: true
+
+      - name: Run All Tests with Race Detector
+        run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Build CGO-free Binary
+        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/server ./cmd/server
+
+
+--- File: ./docker-compose.yml ---
+services:
+  plos:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: plos_app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - PORT=8080
+      - DB_PATH=/app/data/finance.db
+    restart: unless-stopped
+
+
+--- File: ./data/.gitkeep ---
+
+

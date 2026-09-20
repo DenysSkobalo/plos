@@ -16,7 +16,8 @@
 
 # Node.js / Frontend
 /web/node_modules/
-/web/dist/
+/web/dist/*
+!/web/dist/index.html
 /web/.svelte-kit/
 /web/.vite/
 .npm
