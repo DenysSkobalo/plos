@@ -1,4 +1,4 @@
-name: Backend CI
+name: Backend & Docker CI
 
 on:
   push:
@@ -21,12 +21,12 @@ jobs:
           cache: true
 
       - name: golangci-lint
-        uses: golangci-lint/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v6
         with:
           version: v1.60.3
 
-  test:
-    name: Test & Build
+  test-and-build:
+    name: Test, Build & Docker Verification
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -41,5 +41,13 @@ jobs:
       - name: Run All Tests with Race Detector
         run: go test -v -race -coverprofile=coverage.out -covermode=atomic ./...
 
-      - name: Build CGO-free Binary
-        run: CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/server ./cmd/server
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Test Docker Image Build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          tags: plos:ci-test
