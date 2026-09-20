@@ -19,7 +19,7 @@
 
 \section{System Architecture Overview}
 
-The PLOS backend is engineered following the Clean/Hexagonal Architecture pattern, enforcing a strict separation of concerns across software layers. The entire system is compiled into a single, static CGO-free binary targeting \textbf{Go 1.25.0}.
+The PLOS backend is engineered following the Clean/Hexagonal Architecture pattern, enforcing a strict separation of concerns across software layers. The entire system is compiled into a single static binary targeting \textbf{Go 1.25.0}.
 
 \begin{figure}[htbp]
 \centering
@@ -31,7 +31,7 @@ The PLOS backend is engineered following the Clean/Hexagonal Architecture patter
     \node [layer, below=of client] (transport) {\textbf{Transport Layer} (\texttt{internal/transport/http})\\Chi Mux, Middleware, Embedded Static FS};
     \node [layer, below=of transport] (domain) {\textbf{Domain Services \& Pure Engine} (\texttt{internal/domain/finance})\\Cashflow Engine, Rate Service, Export Service};
     \node [layer, below=of domain] (repo) {\textbf{Domain Data Layer}\\Repository Interface \& SQLite Implementation};
-    \node [layer, below=of repo] (core) {\textbf{Core Infrastructure Layer} (\texttt{internal/core})\\SQLite Init (CGO-Free), Pragmas, Embedded Migrator};
+    \node [layer, below=of repo] (core) {\textbf{Core Infrastructure Layer} (\texttt{internal/core})\\SQLite Init, Pragmas, Embedded Migrator};
 
     \draw[->, thick] (client) -- (transport);
     \draw[->, thick] (transport) -- (domain);
@@ -51,7 +51,7 @@ The PLOS backend is engineered following the Clean/Hexagonal Architecture patter
 \endfoot
 \texttt{cmd/server} & Application Entrypoint & Initializes logger (\texttt{slog}), configuration, database pools, migrator, and HTTP server with graceful shutdown handling. \\
 \texttt{internal/config} & Configuration & Loads runtime environment variables (\texttt{DB\_PATH}). \\
-\texttt{internal/core} & Storage Infrastructure & Manages CGO-free SQLite initialization, SQLite Pragmas, and transactional migration execution. \\
+\texttt{internal/core} & Storage Infrastructure & Manages SQLite initialization, SQLite Pragmas, and transactional migration execution. \\
 \texttt{internal/domain/finance} & Domain Models \& Logic & Defines domain entities, Repository contracts, SQLite repository, Rate service, and deterministic Cashflow Engine. \\
 \texttt{internal/transport/http} & Transport / REST API & REST endpoints via \texttt{chi.Mux}, JSON serialization, request validation, and error handling. \\
 \texttt{migrations} & Database Schemas & Versioned SQL migration files embedded directly into the binary using \texttt{embed.FS}. \\
@@ -61,16 +61,12 @@ The PLOS backend is engineered following the Clean/Hexagonal Architecture patter
 
 \section{System Level \& Storage Subsystem Mechanics}
 
-\subsection{CGO-Free SQLite Driver \& Database Connection Pool}
+\subsection{SQLite Driver \& Database Connection Pool}
 
-The system utilizes \texttt{modernc.org/sqlite}, a pure Go SQLite implementation created via C-to-Go transpilation. This eliminates runtime dependencies on CGO, enabling true cross-platform \texttt{CGO\_ENABLED=0} static compilation and removing context-switching overhead between the Go goroutine stack and the C execution stack.
-
-The connection pool is intentionally restricted to prevent file-level lock contention:
+The system utilizes \texttt{modernc.org/sqlite}, a pure Go SQLite implementation, compiled statically. To leverage SQLite's Write-Ahead Logging (WAL) concurrency, the database connection pool is configured as:
 \begin{equation}
-\text{MaxOpenConns} = 1, \quad \text{MaxIdleConns} = 1, \quad \text{ConnMaxIdleTime} = 5\text{ minutes}
+\text{MaxOpenConns} = 10, \quad \text{MaxIdleConns} = 5, \quad \text{ConnMaxIdleTime} = 5\text{ minutes}
 \end{equation}
-
-Restricting SQLite writes to a single open connection serializes write operations at the application level, completely preventing \texttt{SQLITE\_BUSY} lock errors.
 
 \subsection{SQLite Hardware Sympathy Configuration (Pragmas)}
 
@@ -84,51 +80,52 @@ The database is initialized using optimal SQLite Pragmas tuned for SSD/NVMe stor
 
 \section{Cashflow Engine Mechanics}
 
-The \texttt{CashflowEngine} is a pure, deterministic domain engine free from I/O dependencies or system calls.
+The \texttt{CashflowEngine} is a pure, deterministic domain engine processing monetary attributes using fixed-point integer cents (\texttt{int64}) to prevent IEEE-754 floating-point rounding inaccuracies.
 
 \subsection{Mathematical Model of the Two-Phase Cascade Algorithm}
 
-Let the exchange rate for EUR/UAH be $R_{\text{buy}}$. Foreign currency amounts are normalized to the base currency (EUR):
+Foreign currency integer amounts $A_{\text{cents}}$ are normalized to base currency (EUR cents) using rounded division against $R_{\text{buy}}$:
 \begin{equation}
-\text{Amount}_{\text{EUR}} = 
+A_{\text{EUR, cents}} = 
 \begin{cases} 
-\text{Amount}, & \text{if Currency} = \text{EUR} \\ 
-\frac{\text{Amount}}{R_{\text{buy}}}, & \text{if Currency} = \text{UAH} 
+A_{\text{cents}}, & \text{if Currency} = \text{EUR} \\ 
+\left\lfloor \frac{A_{\text{cents}}}{R_{\text{buy}}} + 0.5 \right\rfloor, & \text{if Currency} = \text{UAH} 
 \end{cases}
 \end{equation}
 
 The total available liquidity for the monthly period is calculated as:
 \begin{equation}
-C_{\text{avail}} = \sum \text{Income}_{\text{EUR}} - \sum \text{Expense}_{\text{EUR}}
+C_{\text{avail, cents}} = \sum \text{Income}_{\text{EUR, cents}} - \sum \text{Expense}_{\text{EUR, cents}}
 \end{equation}
 
 \subsubsection{Phase A: Mandatory Minimum Payments}
-For each active debt $d_i \in D$, the mandatory minimum payment is applied regardless of priority:
+For each active debt $d_i \in D$, mandatory minimum payments are applied in EUR cents:
 \begin{equation}
-P_{\text{min}, i} = \min\left(\text{MinPayment}_{\text{EUR}}(d_i), \text{Remaining}_{\text{EUR}}(d_i), C_{\text{avail}}\right)
+P_{\text{min}, i} = \min\left(\text{MinPayment}_{\text{EUR, cents}}(d_i), \text{Remaining}_{\text{EUR, cents}}(d_i), C_{\text{avail, cents}}\right)
 \end{equation}
 \begin{equation}
-\text{Remaining}_{\text{EUR}}(d_i) \leftarrow \text{Remaining}_{\text{EUR}}(d_i) - P_{\text{min}, i}
+\text{Remaining}_{\text{cents}}(d_i) \leftarrow \text{Remaining}_{\text{cents}}(d_i) - P_{\text{min, original}, i}
 \end{equation}
 \begin{equation}
-C_{\text{avail}} \leftarrow C_{\text{avail}} - P_{\text{min}, i}
+C_{\text{avail, cents}} \leftarrow C_{\text{avail, cents}} - P_{\text{min}, i}
 \end{equation}
 
 \subsubsection{Phase B: Cascade Priority Surplus Distribution}
-Iterating through active debts sorted in strict priority order ($P_1 \to P_n$), remaining available liquidity $C_{\text{avail}}$ is cascaded:
+Iterating through active debts sorted in strict priority order ($P_1 \to P_n$), remaining available liquidity $C_{\text{avail, cents}}$ is cascaded:
 \begin{equation}
-P_{\text{extra}, k} = \min\left(C_{\text{avail}}, \text{Remaining}_{\text{EUR}}(d_k)\right)
+P_{\text{extra}, k} = \min\left(C_{\text{avail, cents}}, \text{Remaining}_{\text{EUR, cents}}(d_k)\right)
 \end{equation}
 \begin{equation}
-\text{Remaining}_{\text{EUR}}(d_k) \leftarrow \text{Remaining}_{\text{EUR}}(d_k) - P_{\text{extra}, k}
+\text{Remaining}_{\text{cents}}(d_k) \leftarrow \text{Remaining}_{\text{cents}}(d_k) - P_{\text{extra, original}, k}
 \end{equation}
 \begin{equation}
-C_{\text{avail}} \leftarrow C_{\text{avail}} - P_{\text{extra}, k}
+C_{\text{avail, cents}} \leftarrow C_{\text{avail, cents}} - P_{\text{extra}, k}
 \end{equation}
 
-To avoid floating-point representation anomalies ($\epsilon$-precision errors):
+\subsubsection{Termination Condition}
+Debt payoff state transitions strictly on exact integer thresholds:
 \begin{equation}
-\forall d_i \in D, \quad \text{if } \text{Remaining}_{\text{EUR}}(d_i) \le 0.01 \implies \text{Remaining}(d_i) = 0, \quad \text{Status}(d_i) = \text{PAID}
+\forall d_i \in D, \quad \text{if } \text{Remaining}_{\text{cents}}(d_i) \le 0 \implies \text{Remaining}_{\text{cents}}(d_i) = 0, \quad \text{Status}(d_i) = \text{PAID}
 \end{equation}
 
 \section{REST API Specification}
@@ -144,11 +141,11 @@ To avoid floating-point representation anomalies ($\epsilon$-precision errors):
 \texttt{GET} & \texttt{/api/v1/rates} & \texttt{200 OK} & Query latest exchange rates. \\
 \texttt{POST} & \texttt{/api/v1/rates/sync} & \texttt{200 OK} & Trigger rate sync via Monobank Public API. \\
 \texttt{POST} & \texttt{/api/v1/rates/manual} & \texttt{200 OK} & Set manual rate override. \\
-\texttt{GET} & \texttt{/api/v1/accounts} & \texttt{200 OK} & Retrieve financial accounts list. \\
-\texttt{POST} & \texttt{/api/v1/accounts} & \texttt{201 Created} & Create new financial account/category. \\
+\texttt{GET} & \texttt{/api/v1/accounts} & \texttt{200 OK} & Retrieve financial accounts list (\texttt{current\_balance\_cents}). \\
+\texttt{POST} & \texttt{/api/v1/accounts} & \texttt{201 Created} & Create new financial account/category (\texttt{initial\_balance\_cents}). \\
 \texttt{GET} & \texttt{/api/v1/debts} & \texttt{200 OK} & Get active debts ordered by priority ($P_1 \to P_n$). \\
 \texttt{POST} & \texttt{/api/v1/debts} & \texttt{200 OK} & Upsert debt metadata attributes. \\
-\texttt{POST} & \texttt{/api/v1/cashflow/simulate} & \texttt{200 OK} & Run one-step cascade payoff simulation. \\
+\texttt{POST} & \texttt{/api/v1/cashflow/simulate} & \texttt{200 OK} & Run one-step cascade payoff simulation (\texttt{amount\_cents}). \\
 \texttt{GET} & \texttt{/api/v1/export/debts.csv} & \texttt{200 OK} & Export active debts as RFC 4180 CSV stream. \\
 \caption{API Route Index and Endpoint Definitions.}
 \end{longtable}
