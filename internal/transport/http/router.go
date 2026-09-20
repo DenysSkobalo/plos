@@ -3,6 +3,7 @@ package http
 import (
 	"encoding/json"
 	"net/http"
+	"strconv"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
@@ -58,6 +59,7 @@ func (s *Server) routes() {
 		r.Get("/debts", s.handleGetDebts)
 		r.Post("/debts", s.handleSetDebtMetadata)
 
+		r.Get("/transactions", s.handleGetTransactions)
 		r.Post("/cashflow/simulate", s.handleSimulateCashflow)
 		r.Get("/export/debts.csv", s.handleExportDebtsCSV)
 	})
@@ -211,6 +213,28 @@ func (s *Server) handleSimulateCashflow(w http.ResponseWriter, r *http.Request) 
 
 	projection, _ := s.engine.SimulateMonth(req.MonthName, req.Incomes, req.Expenses, states, req.BuyRate)
 	respondJSON(w, http.StatusOK, projection)
+}
+
+func (s *Server) handleGetTransactions(w http.ResponseWriter, r *http.Request) {
+	limitStr := r.URL.Query().Get("limit")
+	limit := 100
+	if limitStr != "" {
+		if parsed, err := strconv.Atoi(limitStr); err == nil && parsed > 0 {
+			limit = parsed
+		}
+	}
+
+	txs, err := s.repo.GetTransactions(r.Context(), limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	if txs == nil {
+		txs = []finance.Transaction{}
+	}
+
+	respondJSON(w, http.StatusOK, txs)
 }
 
 func (s *Server) handleExportDebtsCSV(w http.ResponseWriter, r *http.Request) {
