@@ -46,6 +46,9 @@ func (s *Server) routes() {
 	s.router.Use(middleware.Recoverer)
 
 	s.router.Route("/api/v1", func(r chi.Router) {
+		r.Get("/currencies", s.handleGetCurrencies)
+		r.Post("/currencies", s.handleCreateCurrency)
+
 		r.Get("/rates", s.handleGetRates)
 		r.Post("/rates/sync", s.handleSyncRates)
 		r.Post("/rates/manual", s.handleSetManualRate)
@@ -56,11 +59,32 @@ func (s *Server) routes() {
 		r.Post("/debts", s.handleSetDebtMetadata)
 
 		r.Post("/cashflow/simulate", s.handleSimulateCashflow)
-
 		r.Get("/export/debts.csv", s.handleExportDebtsCSV)
 	})
 }
 
+func (s *Server) handleGetCurrencies(w http.ResponseWriter, r *http.Request) {
+	currencies, err := s.repo.GetCurrencies(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	respondJSON(w, http.StatusOK, currencies)
+}
+
+func (s *Server) handleCreateCurrency(w http.ResponseWriter, r *http.Request) {
+	var c finance.Currency
+	if err := json.NewDecoder(r.Body).Decode(&c); err != nil {
+		http.Error(w, "invalid payload", http.StatusBadRequest)
+		return
+	}
+
+	if err := s.repo.AddCurrency(r.Context(), c); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
 func (s *Server) handleGetRates(w http.ResponseWriter, r *http.Request) {
 	rates, err := s.repo.GetLatestRates(r.Context())
 	if err != nil {

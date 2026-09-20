@@ -48,19 +48,13 @@ func TestSQLiteRepository_CurrenciesAndAccounts(t *testing.T) {
 
 	ctx := context.Background()
 
-	if err := repo.AddCurrency(ctx, Currency{Code: "EUR", Symbol: "€"}); err != nil {
-		t.Fatalf("AddCurrency EUR failed: %v", err)
-	}
-	if err := repo.AddCurrency(ctx, Currency{Code: "UAH", Symbol: "₴"}); err != nil {
-		t.Fatalf("AddCurrency UAH failed: %v", err)
-	}
-
+	// Усі 3 бази валюти (EUR, UAH, USD) ініціалізовані міграцією
 	currencies, err := repo.GetCurrencies(ctx)
 	if err != nil {
 		t.Fatalf("GetCurrencies failed: %v", err)
 	}
-	if len(currencies) != 2 {
-		t.Fatalf("expected 2 currencies, got %d", len(currencies))
+	if len(currencies) != 3 {
+		t.Fatalf("expected 3 seed currencies, got %d", len(currencies))
 	}
 
 	acc := Account{

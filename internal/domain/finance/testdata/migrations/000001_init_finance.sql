@@ -4,11 +4,17 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
--- Currencies
+-- Currencies Reference Table
 CREATE TABLE IF NOT EXISTS currencies (
     code TEXT PRIMARY KEY,
     symbol TEXT NOT NULL
 );
+
+-- Base ISO Currencies Seed
+INSERT OR IGNORE INTO currencies (code, symbol) VALUES 
+    ('EUR', '€'),
+    ('UAH', '₴'),
+    ('USD', '$');
 
 -- Exchange Rates
 CREATE TABLE IF NOT EXISTS exchange_rates (
